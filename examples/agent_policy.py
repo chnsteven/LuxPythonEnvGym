@@ -191,7 +191,7 @@ class AgentPolicy(AgentWithModel):
         # ═══════════════════════════════════════════════════════════════════════
         # 总维度: 8 + 12 + 12 + 12 + 6 + 4 + 11 = 65 维
         # ═══════════════════════════════════════════════════════════════════════
-        self.observation_shape = (65,)
+        self.observation_shape = (49,)
         self.observation_space = spaces.Box(low=0, high=1, shape=self.observation_shape, dtype=np.float16)
 
         self.object_nodes = {}
@@ -251,6 +251,7 @@ class AgentPolicy(AgentWithModel):
         # Add your own and opponent units
         for t in [team, (team + 1) % 2]:
             for u in game.state["teamStates"][team]["units"].values():
+
                 key = str(u.type)
                 if t != team:
                     key = str(u.type) + "_opponent"
@@ -300,7 +301,7 @@ class AgentPolicy(AgentWithModel):
         if is_new_turn:
             self.get_initial_observation(game, unit, city_tile, team)
 
-        obs = np.zeros(self.observation_shape, dtype=np.float16)
+        obs = np.zeros(self.observation_shape, dtype=np.float32)
         idx = 0
         
         # 获取当前位置
@@ -424,41 +425,41 @@ class AgentPolicy(AgentWithModel):
         # ═══════════════════════════════════════════════════════════════════════
         # 4. 敌方单位 (Enemy Units) - Top-3 × 4 = 12 维
         # ═══════════════════════════════════════════════════════════════════════
-        if pos is not None:
-            enemy_units = []
-            for unit_type in [Constants.UNIT_TYPES.WORKER, Constants.UNIT_TYPES.CART]:
-                key = str(unit_type) + "_opponent"
-                if key in self.object_nodes:
-                    for node in self.object_nodes[key]:
-                        node_pos = Position(node[0], node[1])
-                        distance = pos.distance_to(node_pos)
-                        cell = game.map.get_cell_by_pos(node_pos)
-                        if len(cell.units) > 0:
-                            u = next(iter(cell.units.values()))
-                            cargo_left = u.get_cargo_space_left()
-                            enemy_units.append({
-                                'type': unit_type,
-                                'distance': distance,
-                                'cargo_left': cargo_left
-                            })
+        # if pos is not None:
+        #     enemy_units = []
+        #     for unit_type in [Constants.UNIT_TYPES.WORKER, Constants.UNIT_TYPES.CART]:
+        #         key = str(unit_type) + "_opponent"
+        #         if key in self.object_nodes:
+        #             for node in self.object_nodes[key]:
+        #                 node_pos = Position(node[0], node[1])
+        #                 distance = pos.distance_to(node_pos)
+        #                 cell = game.map.get_cell_by_pos(node_pos)
+        #                 if len(cell.units) > 0:
+        #                     u = next(iter(cell.units.values()))
+        #                     cargo_left = u.get_cargo_space_left()
+        #                     enemy_units.append({
+        #                         'type': unit_type,
+        #                         'distance': distance,
+        #                         'cargo_left': cargo_left
+        #                     })
             
-            # 按距离排序，取Top-3
-            enemy_units.sort(key=lambda x: x['distance'])
-            for i in range(3):
-                if i < len(enemy_units):
-                    u = enemy_units[i]
-                    # type one-hot (2维)
-                    if u['type'] == Constants.UNIT_TYPES.WORKER:
-                        obs[idx] = 1.0
-                    else:
-                        obs[idx + 1] = 1.0
-                    # distance (1维): normalized by MAX_DISTANCE
-                    obs[idx + 2] = u['distance'] / self.max_distance
-                    # cargo_left (1维): normalized by RESOURCE_CAPACITY.WORKER = 100
-                    obs[idx + 3] = u['cargo_left'] / self.cargo_capacity
-                idx += 4
-        else:
-            idx += 12
+        #     # 按距离排序，取Top-3
+        #     enemy_units.sort(key=lambda x: x['distance'])
+        #     for i in range(3):
+        #         if i < len(enemy_units):
+        #             u = enemy_units[i]
+        #             # type one-hot (2维)
+        #             if u['type'] == Constants.UNIT_TYPES.WORKER:
+        #                 obs[idx] = 1.0
+        #             else:
+        #                 obs[idx + 1] = 1.0
+        #             # distance (1维): normalized by MAX_DISTANCE
+        #             obs[idx + 2] = u['distance'] / self.max_distance
+        #             # cargo_left (1维): normalized by RESOURCE_CAPACITY.WORKER = 100
+        #             obs[idx + 3] = u['cargo_left'] / self.cargo_capacity
+        #         idx += 4
+        # else:
+        #     idx += 12
         
         # ═══════════════════════════════════════════════════════════════════════
         # 5. 友方城市 (Friendly Cities) - Top-2 × 3 = 6 维
@@ -508,37 +509,37 @@ class AgentPolicy(AgentWithModel):
         # ═══════════════════════════════════════════════════════════════════════
         # 6. 敌方城市 (Enemy Cities) - Top-2 × 2 = 4 维
         # ═══════════════════════════════════════════════════════════════════════
-        if pos is not None:
-            enemy_cities = []
-            opponent_team = (team + 1) % 2
-            for city in game.cities.values():
-                if city.team == opponent_team:
-                    # 找到城市中最近的tile
-                    min_dist = float('inf')
-                    for cell in city.city_cells:
-                        dist = pos.distance_to(cell.pos)
-                        if dist < min_dist:
-                            min_dist = dist
+        # if pos is not None:
+        #     enemy_cities = []
+        #     opponent_team = (team + 1) % 2
+        #     for city in game.cities.values():
+        #         if city.team == opponent_team:
+        #             # 找到城市中最近的tile
+        #             min_dist = float('inf')
+        #             for cell in city.city_cells:
+        #                 dist = pos.distance_to(cell.pos)
+        #                 if dist < min_dist:
+        #                     min_dist = dist
                     
-                    tile_count = len(city.city_cells)
+        #             tile_count = len(city.city_cells)
                     
-                    enemy_cities.append({
-                        'distance': min_dist,
-                        'tile_count': tile_count
-                    })
+        #             enemy_cities.append({
+        #                 'distance': min_dist,
+        #                 'tile_count': tile_count
+        #             })
             
-            # 按距离排序，取Top-2
-            enemy_cities.sort(key=lambda x: x['distance'])
-            for i in range(2):
-                if i < len(enemy_cities):
-                    c = enemy_cities[i]
-                    # distance (1维): normalized by MAX_DISTANCE
-                    obs[idx] = c['distance'] / self.max_distance
-                    # tile_count (1维): normalized by map area (W*H)
-                    obs[idx + 1] = c['tile_count'] / self.max_city_tiles
-                idx += 2
-        else:
-            idx += 4
+        #     # 按距离排序，取Top-2
+        #     enemy_cities.sort(key=lambda x: x['distance'])
+        #     for i in range(2):
+        #         if i < len(enemy_cities):
+        #             c = enemy_cities[i]
+        #             # distance (1维): normalized by MAX_DISTANCE
+        #             obs[idx] = c['distance'] / self.max_distance
+        #             # tile_count (1维): normalized by map area (W*H)
+        #             obs[idx + 1] = c['tile_count'] / self.max_city_tiles
+        #         idx += 2
+        # else:
+        #     idx += 4
         
         # ═══════════════════════════════════════════════════════════════════════
         # 7. 全局信息 (Global State) - 11 维
@@ -857,33 +858,15 @@ class AgentPolicy(AgentWithModel):
         rewards = {}
         
         # ═══════════════════════════════════════════════════════════════════════
-        # 高优先级奖励：单位生存和城市生存
-        # ═══════════════════════════════════════════════════════════════════════
-        
-        # 单位生存奖励（分 worker 和 cart）
-        # Worker 生存奖励：+0.15 per worker gained, -0.15 per worker lost
-        rewards["rew/r_worker_survival"] = (worker_count - self.workers_last) * 0.05
-        self.workers_last = worker_count
-        
-        # Cart 生存奖励：+0.10 per cart gained, -0.10 per cart lost
-        rewards["rew/r_cart_survival"] = (cart_count - self.carts_last) * 0.05
-        self.carts_last = cart_count
-        
-        # 城市生存奖励（按城市数量，不是 tile 数量）
-        # +0.20 per city gained, -0.20 per city lost
-        rewards["rew/r_city_survival"] = (city_count - self.cities_last) * 0.10
-        self.cities_last = city_count
-        
-        # ═══════════════════════════════════════════════════════════════════════
         # 中等优先级奖励：城市扩张和单位创建
         # ═══════════════════════════════════════════════════════════════════════
         
         # Give a reward for unit creation/death. 0.05 reward per unit.
-        rewards["rew/r_units"] = (unit_count - self.units_last) * 0.05
+        rewards["rew/r_units"] = (unit_count - self.units_last) * 0.1
         self.units_last = unit_count
 
         # Give a reward for city creation/death. 0.1 reward per city.
-        rewards["rew/r_city_tiles"] = (city_tile_count - self.city_tiles_last) * 0.1
+        rewards["rew/r_city_tiles"] = (city_tile_count - self.city_tiles_last) * 0.2
         self.city_tiles_last = city_tile_count
 
         # ═══════════════════════════════════════════════════════════════════════
@@ -941,7 +924,7 @@ class AgentPolicy(AgentWithModel):
         rewards["rew/r_city_tiles_end"] = 0
         if is_game_finished:
             self.is_last_turn = True
-            rewards["rew/r_city_tiles_end"] = city_tile_count
+            rewards["rew/r_city_tiles_end"] = city_tile_count * 0.01
 
             '''
             # Example of a game win/loss reward instead
@@ -995,42 +978,6 @@ class AgentPolicy(AgentWithModel):
                 if not city_tile.can_act():
                     continue
                 action = ResearchAction(
-                    team=self.team,
-                    x=city_tile.pos.x,
-                    y=city_tile.pos.y,
-                    unit_id=None,
-                )
-                self.match_controller.take_action(action)
-
-    def no_cart_without_worker_heuristic(self, game):
-        """
-        Heuristic: prevent city tiles from spawning a cart when the team has
-        no workers alive.
-
-        If there are zero workers, any city tile that would otherwise produce a
-        cart is redirected to spawn a worker instead.  This avoids the degenerate
-        state where the team ends up with only carts and no workers to collect
-        resources.
-        """
-        # Count current workers for our team
-        worker_count = sum(
-            1
-            for unit in game.state["teamStates"][self.team]["units"].values()
-            if unit.type == Constants.UNIT_TYPES.WORKER
-        )
-
-        if worker_count > 0:
-            return  # Workers exist — no intervention needed
-
-        # No workers: force every idle city tile to spawn a worker
-        for city in game.cities.values():
-            if city.team != self.team:
-                continue
-            for cell in city.city_cells:
-                city_tile = cell.city_tile
-                if not city_tile.can_act():
-                    continue
-                action = SpawnWorkerAction(
                     team=self.team,
                     x=city_tile.pos.x,
                     y=city_tile.pos.y,
