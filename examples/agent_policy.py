@@ -6,7 +6,7 @@ import copy
 import random
 
 import numpy as np
-from gym import spaces
+from gymnasium import spaces
 
 from luxai2021.env.agent import Agent, AgentWithModel
 from luxai2021.game.actions import *
@@ -192,7 +192,7 @@ class AgentPolicy(AgentWithModel):
         #   时间城市: 1 + 1 + 1 + 1 = 4
         #   新增:    1 + 1 + 1 + 1 + 1 = 5
         #   TOTAL  = 73 + 1 + 11 + 4 + 5 = 94
-        self.observation_shape = (91,)
+        self.observation_shape = (94,)
         self.observation_space = spaces.Box(low=0, high=1, shape=
         self.observation_shape, dtype=np.float16)
 
@@ -493,30 +493,30 @@ class AgentPolicy(AgentWithModel):
         if pos is not None:
             cell = game.map.get_cell_by_pos(pos)
             
-            # # ch0: wood 资源量（÷ 500）
-            # if cell.has_resource() and cell.resource.type == Constants.RESOURCE_TYPES.WOOD:
-            #     obs[observation_index] = min(cell.resource.amount / MAX_WOOD_AMOUNT, 1.0)
-            # else:
-            #     obs[observation_index] = 0.0
-            # observation_index += 1
+            # ch0: wood 资源量（÷ 500）
+            if cell.has_resource() and cell.resource.type == Constants.RESOURCE_TYPES.WOOD:
+                obs[observation_index] = min(cell.resource.amount / MAX_WOOD_AMOUNT, 1.0)
+            else:
+                obs[observation_index] = 0.0
+            observation_index += 1
             
-            # # ch1: coal 资源量（已研究才有值，÷ 500）
-            # if (cell.has_resource() and 
-            #     cell.resource.type == Constants.RESOURCE_TYPES.COAL and
-            #     game.state["teamStates"][team]["researched"]["coal"]):
-            #     obs[observation_index] = min(cell.resource.amount / 500.0, 1.0)
-            # else:
-            #     obs[observation_index] = 0.0
-            # observation_index += 1
+            # ch1: coal 资源量（已研究才有值，÷ 500）
+            if (cell.has_resource() and 
+                cell.resource.type == Constants.RESOURCE_TYPES.COAL and
+                game.state["teamStates"][team]["researched"]["coal"]):
+                obs[observation_index] = min(cell.resource.amount / 500.0, 1.0)
+            else:
+                obs[observation_index] = 0.0
+            observation_index += 1
             
-            # # ch2: uranium 资源量（已研究才有值，÷ 500）
-            # if (cell.has_resource() and 
-            #     cell.resource.type == Constants.RESOURCE_TYPES.URANIUM and
-            #     game.state["teamStates"][team]["researched"]["uranium"]):
-            #     obs[observation_index] = min(cell.resource.amount / 500.0, 1.0)
-            # else:
-            #     obs[observation_index] = 0.0
-            # observation_index += 1
+            # ch2: uranium 资源量（已研究才有值，÷ 500）
+            if (cell.has_resource() and 
+                cell.resource.type == Constants.RESOURCE_TYPES.URANIUM and
+                game.state["teamStates"][team]["researched"]["uranium"]):
+                obs[observation_index] = min(cell.resource.amount / 500.0, 1.0)
+            else:
+                obs[observation_index] = 0.0
+            observation_index += 1
             
             # ch3: 己方单位密度（3x3 区域内己方单位数 ÷ 9）
             friendly_unit_count = 0
@@ -745,6 +745,9 @@ class AgentPolicy(AgentWithModel):
         self.city_fuel_last = 0
         # cooldown 追踪：记录上一回合各单位的 cooldown 值，用于检测溢出
         self.unit_cooldowns_last = {}  # {unit_id: cooldown}
+        # research 状态追踪：记录上一回合的解锁状态，用于检测新资源解锁
+        self.researched_coal_last = False
+        self.researched_uranium_last = False
 
         # ── Heuristic Curriculum ──────────────────────────────────────────────
         # 每局游戏开始时累加局数计数器，用于指数衰减 heuristic 介入概率。
@@ -810,10 +813,48 @@ class AgentPolicy(AgentWithModel):
         rewards["rew/r_city_tiles"] = (city_tile_count - self.city_tiles_last) * 0.1
         self.city_tiles_last = city_tile_count
 
-        # Reward collecting fuel
+        # Reward collecting fuel.
+        # When a new resource tier is unlocked (coal or uranium), give a one-time
+        # unlock bonus and boost the fuel-collection reward multiplier for that turn
+        # to reinforce the value of mining the newly accessible resource.
+        #
+        # Research thresholds (from game_constants.json):
+        #   coal:    50 research points  → fuel rate ×10 vs wood
+        #   uranium: 200 research points → fuel rate ×40 vs wood
+        #
+        # Multiplier logic:
+        #   - uranium just unlocked → 3× fuel reward this turn + 1.0 unlock bonus
+        #   - coal just unlocked    → 2× fuel reward this turn + 0.5 unlock bonus
+        #   - uranium already known → 2× fuel reward (mining high-value resource)
+        #   - coal already known    → 1.5× fuel reward
+        #   - only wood available   → 1× (baseline)
+        researched_coal    = game.state["teamStates"][self.team]["researched"]["coal"]
+        researched_uranium = game.state["teamStates"][self.team]["researched"]["uranium"]
+
+        just_unlocked_coal    = researched_coal    and not self.researched_coal_last
+        just_unlocked_uranium = researched_uranium and not self.researched_uranium_last
+
+        rewards["rew/r_unlock_coal"]    = 0.5 if just_unlocked_coal    else 0.0
+        rewards["rew/r_unlock_uranium"] = 1.0 if just_unlocked_uranium else 0.0
+
+        if just_unlocked_uranium:
+            fuel_multiplier = 3.0
+        elif just_unlocked_coal:
+            fuel_multiplier = 2.0
+        elif researched_uranium:
+            fuel_multiplier = 2.0
+        elif researched_coal:
+            fuel_multiplier = 1.5
+        else:
+            fuel_multiplier = 1.0
+
         fuel_collected = game.stats["teamStats"][self.team]["fuelGenerated"]
-        rewards["rew/r_fuel_collected"] = ( (fuel_collected - self.fuel_collected_last) / 20000 )
+        rewards["rew/r_fuel_collected"] = (fuel_collected - self.fuel_collected_last) / 20000 * fuel_multiplier
         self.fuel_collected_last = fuel_collected
+
+        # Update research state for next turn
+        self.researched_coal_last    = researched_coal
+        self.researched_uranium_last = researched_uranium
         
         # Give a reward of 1.0 per city tile alive at the end of the game
         rewards["rew/r_city_tiles_end"] = 0
@@ -1056,12 +1097,8 @@ class AgentPolicy(AgentWithModel):
 
         # Each heuristic is independently sampled so they can decay at the same
         # rate but don't always activate together (adds stochasticity).
-        if random.random() < prob:
-            self.research_heuristic(game)
+        # if random.random() < prob:
+        self.research_heuristic(game)
         # no_cart_without_worker is now enforced via action masking in take_action(),
         # so it no longer needs to be called here as a hard override.
         return
-    
-    
-    
-
