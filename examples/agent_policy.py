@@ -191,7 +191,7 @@ class AgentPolicy(AgentWithModel):
         # ═══════════════════════════════════════════════════════════════════════
         # 总维度: 8 + 12 + 12 + 12 + 6 + 4 + 11 = 65 维
         # ═══════════════════════════════════════════════════════════════════════
-        self.observation_shape = (49,)
+        self.observation_shape = (37,)
         self.observation_space = spaces.Box(low=0, high=1, shape=self.observation_shape, dtype=np.float16)
 
         self.object_nodes = {}
@@ -862,11 +862,11 @@ class AgentPolicy(AgentWithModel):
         # ═══════════════════════════════════════════════════════════════════════
         
         # Give a reward for unit creation/death. 0.05 reward per unit.
-        rewards["rew/r_units"] = (unit_count - self.units_last) * 0.1
+        rewards["rew/r_units"] = (unit_count - self.units_last) * 0.05
         self.units_last = unit_count
 
         # Give a reward for city creation/death. 0.1 reward per city.
-        rewards["rew/r_city_tiles"] = (city_tile_count - self.city_tiles_last) * 0.2
+        rewards["rew/r_city_tiles"] = (city_tile_count - self.city_tiles_last) * 0.1
         self.city_tiles_last = city_tile_count
 
         # ═══════════════════════════════════════════════════════════════════════

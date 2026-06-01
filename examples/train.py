@@ -43,7 +43,7 @@ def get_command_line_arguments():
     parser.add_argument('--learning_rate', help='Learning rate', type=float, default=0.001)
     parser.add_argument('--gamma', help='Gamma', type=float, default=0.995)
     parser.add_argument('--gae_lambda', help='GAE Lambda', type=float, default=0.95)
-    parser.add_argument('--batch_size', help='batch_size', type=int, default=512)  # 64
+    parser.add_argument('--batch_size', help='batch_size', type=int, default=1024)  # 64
     parser.add_argument('--step_count', help='Total number of steps to train', type=int, default=10000000)
     parser.add_argument('--n_steps', help='Number of experiences to gather before each learning period', type=int, default=2048)
     parser.add_argument('--path', help='Path to a checkpoint to load to resume training', type=str, default=None)
@@ -64,6 +64,7 @@ def train(args):
     configs = LuxMatchConfigs_Default
 
     # Create a default opponent agent
+    opponent = AgentPolicy(mode="inference", model=PPO.load("../baseline/PPO_5/model.zip"))
     opponent = Agent()
 
     # Create a RL agent in training mode
@@ -118,7 +119,7 @@ def train(args):
                                 replay_env=LuxEnvironment(
                                                 configs=configs,
                                                 learning_agent=player_replay,
-                                                opponent_agent=Agent()
+                                                opponent_agent=AgentPolicy(mode="inference", model=PPO.load("../baseline/PPO_5/model.zip"))
                                 ),
                                 replay_num_episodes=5
                             )
