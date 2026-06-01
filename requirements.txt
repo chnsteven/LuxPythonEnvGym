@@ -1,0 +1,18 @@
+# Lux AI 2021 - Python dependencies (from setup.py)
+# Recommended: Python 3.7.x (required for Kaggle submission compatibility)
+# Also need Node.js 12+ installed on your system
+
+# gym 0.19.0 needs older build tools; install gym with:
+#   pip install -r requirements.txt
+#   pip install gym==0.19.0 --no-build-isolation
+setuptools<58
+wheel<0.38
+
+pytest
+stable_baselines3==1.2.1a2
+numpy
+tensorboard
+gym==0.19.0
+
+# test dependencies
+nose2

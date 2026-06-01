@@ -192,7 +192,7 @@ class AgentPolicy(AgentWithModel):
         #   时间城市: 1 + 1 + 1 + 1 = 4
         #   新增:    1 + 1 + 1 + 1 + 1 = 5
         #   TOTAL  = 73 + 1 + 11 + 4 + 5 = 94
-        self.observation_shape = (91,)
+        self.observation_shape = (94,)
         self.observation_space = spaces.Box(low=0, high=1, shape=
         self.observation_shape, dtype=np.float16)
 
@@ -493,30 +493,30 @@ class AgentPolicy(AgentWithModel):
         if pos is not None:
             cell = game.map.get_cell_by_pos(pos)
             
-            # # ch0: wood 资源量（÷ 500）
-            # if cell.has_resource() and cell.resource.type == Constants.RESOURCE_TYPES.WOOD:
-            #     obs[observation_index] = min(cell.resource.amount / MAX_WOOD_AMOUNT, 1.0)
-            # else:
-            #     obs[observation_index] = 0.0
-            # observation_index += 1
+            # ch0: wood 资源量（÷ 500）
+            if cell.has_resource() and cell.resource.type == Constants.RESOURCE_TYPES.WOOD:
+                obs[observation_index] = min(cell.resource.amount / MAX_WOOD_AMOUNT, 1.0)
+            else:
+                obs[observation_index] = 0.0
+            observation_index += 1
             
-            # # ch1: coal 资源量（已研究才有值，÷ 500）
-            # if (cell.has_resource() and 
-            #     cell.resource.type == Constants.RESOURCE_TYPES.COAL and
-            #     game.state["teamStates"][team]["researched"]["coal"]):
-            #     obs[observation_index] = min(cell.resource.amount / 500.0, 1.0)
-            # else:
-            #     obs[observation_index] = 0.0
-            # observation_index += 1
+            # ch1: coal 资源量（已研究才有值，÷ 500）
+            if (cell.has_resource() and 
+                cell.resource.type == Constants.RESOURCE_TYPES.COAL and
+                game.state["teamStates"][team]["researched"]["coal"]):
+                obs[observation_index] = min(cell.resource.amount / 500.0, 1.0)
+            else:
+                obs[observation_index] = 0.0
+            observation_index += 1
             
-            # # ch2: uranium 资源量（已研究才有值，÷ 500）
-            # if (cell.has_resource() and 
-            #     cell.resource.type == Constants.RESOURCE_TYPES.URANIUM and
-            #     game.state["teamStates"][team]["researched"]["uranium"]):
-            #     obs[observation_index] = min(cell.resource.amount / 500.0, 1.0)
-            # else:
-            #     obs[observation_index] = 0.0
-            # observation_index += 1
+            # ch2: uranium 资源量（已研究才有值，÷ 500）
+            if (cell.has_resource() and 
+                cell.resource.type == Constants.RESOURCE_TYPES.URANIUM and
+                game.state["teamStates"][team]["researched"]["uranium"]):
+                obs[observation_index] = min(cell.resource.amount / 500.0, 1.0)
+            else:
+                obs[observation_index] = 0.0
+            observation_index += 1
             
             # ch3: 己方单位密度（3x3 区域内己方单位数 ÷ 9）
             friendly_unit_count = 0
@@ -551,118 +551,6 @@ class AgentPolicy(AgentWithModel):
             observation_index += 5
 
         return obs
-
-    def get_action_mask(self, game, unit=None, city_tile=None):
-        """
-        Computes a boolean action mask for the given unit or city tile.
-
-        Returns a numpy bool array of length == number of actions in the
-        relevant action list (actions_units or actions_cities).
-        True  = action is ALLOWED
-        False = action is FORBIDDEN
-
-        Action index reference
-        ──────────────────────
-        actions_units  (unit is not None):
-            0  MoveAction CENTER   (do-nothing / stay)
-            1  MoveAction NORTH
-            2  MoveAction WEST
-            3  MoveAction SOUTH
-            4  MoveAction EAST
-            5  TransferAction → cart
-            6  TransferAction → worker
-            7  SpawnCityAction
-            8  PillageAction
-
-        actions_cities  (city_tile is not None):
-            0  SpawnWorkerAction
-            1  SpawnCartAction
-            2  ResearchAction
-
-        All masks are hard constraints (always wrong regardless of game
-        state) and are completely independent of the reward function.
-        """
-
-        # ── CITY TILE MASKS ───────────────────────────────────────────────────
-        if city_tile is not None:
-            n = len(self.actions_cities)
-            mask = np.ones(n, dtype=bool)
-
-            # ── Mask 5: research already maxed (uranium unlocked) ─────────────
-            # ResearchAction (index 2) is pointless once uranium is researched.
-            if game.state["teamStates"][self.team]["researched"][Constants.RESOURCE_TYPES.URANIUM]:
-                mask[2] = False  # ResearchAction
-
-            # ── Heuristic constraint: no cart without a worker ────────────────
-            # SpawnCartAction (index 1) is forbidden when the team has zero
-            # workers alive — a cart with no workers cannot collect resources.
-            worker_count = sum(
-                1
-                for u in game.state["teamStates"][self.team]["units"].values()
-                if u.type == Constants.UNIT_TYPES.WORKER
-            )
-            if worker_count == 0:
-                mask[1] = False  # SpawnCartAction
-
-            return mask
-
-        # ── UNIT MASKS ────────────────────────────────────────────────────────
-        else:
-            n = len(self.actions_units)
-            mask = np.ones(n, dtype=bool)
-
-            if unit is None:
-                return mask
-
-            pos = unit.pos
-
-            # ── Mask 1: map boundary — forbid moves that leave the map ────────
-            # Indices 1-4 correspond to NORTH / WEST / SOUTH / EAST.
-            direction_checks = [
-                (1, 0, -1),           # NORTH: y - 1
-                (2, -1, 0),           # WEST:  x - 1
-                (3, 0, +1),           # SOUTH: y + 1
-                (4, +1, 0),           # EAST:  x + 1
-            ]
-            for idx, dx, dy in direction_checks:
-                nx, ny = pos.x + dx, pos.y + dy
-                if nx < 0 or ny < 0 or nx >= game.map.width or ny >= game.map.height:
-                    mask[idx] = False
-
-            # ── Mask 2: SpawnCity conditions not met ──────────────────────────
-            # SpawnCityAction (index 7) requires:
-            #   a) unit is a worker
-            #   b) current cell has no resource
-            #   c) current cell is not already a city tile
-            #   d) cargo total >= CITY_BUILD_COST (100)
-            build_cost = GAME_CONSTANTS["PARAMETERS"]["CITY_BUILD_COST"]
-            if unit.type != Constants.UNIT_TYPES.WORKER:
-                mask[7] = False
-            else:
-                cell = game.map.get_cell_by_pos(pos)
-                cargo_total = unit.cargo["wood"] + unit.cargo["coal"] + unit.cargo["uranium"]
-                if cell.has_resource() or cell.is_city_tile() or cargo_total < build_cost:
-                    mask[7] = False
-
-            return mask
-
-    def apply_mask(self, action_code, mask):
-        """
-        If the RL-chosen action_code is forbidden by the mask, redirect to
-        the lowest-index allowed action.  If the mask is all-False (should
-        never happen in practice), return action_code unchanged.
-
-        This keeps the RL obs→action sample intact in the replay buffer while
-        still enforcing hard constraints at execution time.
-        """
-        if mask[action_code % len(mask)]:
-            return action_code  # action is allowed, no change
-
-        # Find the first allowed action
-        allowed = np.where(mask)[0]
-        if len(allowed) == 0:
-            return action_code  # fallback: nothing to mask against
-        return int(allowed[0])
 
     def action_code_to_action(self, action_code, game, unit=None, city_tile=None, team=None):
         """
@@ -714,17 +602,7 @@ class AgentPolicy(AgentWithModel):
         """
         Takes an action in the environment according to actionCode:
             actionCode: Index of action to take into the action array.
-
-        Before executing, applies the action mask so that hard-constraint
-        violations (e.g. spawning a cart with no workers) are redirected to
-        a safe action.  The RL network still produced the original action_code
-        and its obs→action sample is already in the replay buffer, so no
-        information is lost.
         """
-        # Apply hard-constraint mask: redirect forbidden actions to a safe one
-        mask = self.get_action_mask(game, unit=unit, city_tile=city_tile)
-        action_code = self.apply_mask(action_code, mask)
-
         action = self.action_code_to_action(action_code, game, unit, city_tile, team)
         self.match_controller.take_action(action)
 
@@ -747,21 +625,21 @@ class AgentPolicy(AgentWithModel):
         self.unit_cooldowns_last = {}  # {unit_id: cooldown}
 
         # ── Heuristic Curriculum ──────────────────────────────────────────────
-        # 每局游戏开始时累加局数计数器，用于指数衰减 heuristic 介入概率。
+        # 每局游戏开始时累加游戏局数计数器，用于衰减 heuristic 介入概率。
         # 仅在训练模式下生效；推理模式下 heuristic_prob 固定为 0（完全由 RL 决策）。
-        #
-        # 衰减公式：heuristic_prob = exp(-games_played / decay_scale)
-        #
-        # 校准基准（10M steps，每局约 360 steps → 约 27800 局）：
-        #   decay_scale=6000  → 训练结束时 prob ≈ 0.01（推荐）
-        #   decay_scale=10000 → 训练结束时 prob ≈ 0.06（更保守，退出更慢）
-        #
-        # 若训练 step 数不同，可在训练前覆盖：
-        #   player.heuristic_decay_scale = total_steps / steps_per_game / 4.6
-        #   （4.6 ≈ -ln(0.01)，使训练结束时 prob 恰好降至 1%）
         if self.mode == "train":
             self._heuristic_games_played = getattr(self, "_heuristic_games_played", 0) + 1
-            decay_scale = getattr(self, "heuristic_decay_scale", 6000)
+            # 指数衰减：prob = exp(-games_played / decay_scale)
+            #
+            # 校准基准（10M steps，每局约 2000 steps → 约 5000 局）：
+            #   decay_scale=1100 → 训练结束时 prob ≈ 0.01（推荐，与 10M steps 对齐）
+            #   decay_scale=2000 → 训练结束时 prob ≈ 0.08（更保守，heuristic 退出更慢）
+            #   decay_scale=500  → 训练进行到 ~30% 时 prob 已降至 0.05（退出过早，不推荐）
+            #
+            # 若训练 step 数不同，可在训练前覆盖：
+            #   player.heuristic_decay_scale = total_steps / steps_per_game / 4.6
+            #   （4.6 ≈ -ln(0.01)，使训练结束时 prob 恰好降至 1%）
+            decay_scale = getattr(self, "heuristic_decay_scale", 1100)
             self.heuristic_prob = math.exp(-self._heuristic_games_played / decay_scale)
         else:
             # 推理/评估时完全关闭 heuristic，让 RL 策略独立运行
@@ -835,59 +713,59 @@ class AgentPolicy(AgentWithModel):
 
         return reward
 
-    # def cargo_heuristic(self, game, is_first_turn, is_night=False):
-    #     """
-    #     Heuristic: only active during the night phase (is_night=True).
+    def cargo_heuristic(self, game, is_first_turn, is_night=False):
+        """
+        Heuristic: only active during the night phase (is_night=True).
 
-    #     Threshold = ceil(unit.get_light_upkeep() * night_turns_remaining)
-    #     expressed as a fuel value. If the unit's current cargo fuel value is
-    #     below this threshold it cannot survive the rest of the night on its
-    #     own, so it is directed toward the nearest friendly city tile.
+        Threshold = ceil(unit.get_light_upkeep() * night_turns_remaining)
+        expressed as a fuel value. If the unit's current cargo fuel value is
+        below this threshold it cannot survive the rest of the night on its
+        own, so it is directed toward the nearest friendly city tile.
 
-    #     Applies to both WORKERs and CARTs.
-    #     """
-    #     if not is_night:
-    #         return
+        Applies to both WORKERs and CARTs.
+        """
+        if not is_night:
+            return
 
-    #     # How many night turns are left in the current night cycle?
-    #     night_length = GAME_CONSTANTS["PARAMETERS"]["NIGHT_LENGTH"]
-    #     day_length   = GAME_CONSTANTS["PARAMETERS"]["DAY_LENGTH"]
-    #     turn         = game.state["turn"]
-    #     # Turn within the current day/night cycle (0-indexed)
-    #     cycle_pos    = turn % (day_length + night_length)
-    #     # Turns already spent in the current night
-    #     night_turns_elapsed = max(0, cycle_pos - day_length)
-    #     night_turns_remaining = night_length - night_turns_elapsed  # 1 … 10
+        # How many night turns are left in the current night cycle?
+        night_length = GAME_CONSTANTS["PARAMETERS"]["NIGHT_LENGTH"]
+        day_length   = GAME_CONSTANTS["PARAMETERS"]["DAY_LENGTH"]
+        turn         = game.state["turn"]
+        # Turn within the current day/night cycle (0-indexed)
+        cycle_pos    = turn % (day_length + night_length)
+        # Turns already spent in the current night
+        night_turns_elapsed = max(0, cycle_pos - day_length)
+        night_turns_remaining = night_length - night_turns_elapsed  # 1 … 10
 
-    #     for unit_id, unit in game.state["teamStates"][self.team]["units"].items():
-    #         if not unit.can_act():
-    #             continue
+        for unit_id, unit in game.state["teamStates"][self.team]["units"].items():
+            if not unit.can_act():
+                continue
 
-    #         # Fuel threshold: minimum fuel needed to survive the rest of this night
-    #         fuel_threshold = math.ceil(unit.get_light_upkeep() * night_turns_remaining)
+            # Fuel threshold: minimum fuel needed to survive the rest of this night
+            fuel_threshold = math.ceil(unit.get_light_upkeep() * night_turns_remaining)
 
-    #         if unit.get_cargo_fuel_value() < fuel_threshold:
-    #             # Find the nearest friendly city tile
-    #             closest_city_tile = None
-    #             closest_dist = float("inf")
-    #             for city in game.cities.values():
-    #                 if city.team != self.team:
-    #                     continue
-    #                 for cell in city.city_cells:
-    #                     dist = unit.pos.distance_to(cell.pos)
-    #                     if dist < closest_dist:
-    #                         closest_dist = dist
-    #                         closest_city_tile = cell
+            if unit.get_cargo_fuel_value() < fuel_threshold:
+                # Find the nearest friendly city tile
+                closest_city_tile = None
+                closest_dist = float("inf")
+                for city in game.cities.values():
+                    if city.team != self.team:
+                        continue
+                    for cell in city.city_cells:
+                        dist = unit.pos.distance_to(cell.pos)
+                        if dist < closest_dist:
+                            closest_dist = dist
+                            closest_city_tile = cell
 
-    #             if closest_city_tile is not None and closest_dist > 0:
-    #                 direction = unit.pos.direction_to(closest_city_tile.pos)
-    #                 action = MoveAction(
-    #                     team=self.team,
-    #                     unit_id=unit.id,
-    #                     direction=direction,
-    #                 )
-    #                 self.match_controller.take_action(action)
-    #     return
+                if closest_city_tile is not None and closest_dist > 0:
+                    direction = unit.pos.direction_to(closest_city_tile.pos)
+                    action = MoveAction(
+                        team=self.team,
+                        unit_id=unit.id,
+                        direction=direction,
+                    )
+                    self.match_controller.take_action(action)
+        return
 
     def research_heuristic(self, game, unit_threshold=1.0):
         """
@@ -915,7 +793,7 @@ class AgentPolicy(AgentWithModel):
         unit_count = len(game.state["teamStates"][self.team]["units"])
         unit_pct = unit_count / city_tile_count  # 0.0 → 1.0+
 
-        if unit_pct < unit_threshold:
+        if unit_pct <= unit_threshold:
             return  # below threshold → let RL decide (spawn or research)
 
         # --- above threshold: force all idle city tiles to research ---
@@ -934,68 +812,68 @@ class AgentPolicy(AgentWithModel):
                 )
                 self.match_controller.take_action(action)
 
-    # def worker_collect_heuristic(self, game, is_night=False, cargo_threshold=0.5):
-    #     """
-    #     Heuristic: only active during the day phase (is_night=False).
+    def worker_collect_heuristic(self, game, is_night=False, cargo_threshold=0.5):
+        """
+        Heuristic: only active during the day phase (is_night=False).
 
-    #     If a worker has a collectable resource in ALL 5 directions
-    #     (CENTER + N/W/S/E), it stays put (MoveAction CENTER) to keep
-    #     mining instead of wandering.
+        If a worker has a collectable resource in ALL 5 directions
+        (CENTER + N/W/S/E), it stays put (MoveAction CENTER) to keep
+        mining instead of wandering.
 
-    #     Exception: if the unit's cargo is already filled above `cargo_threshold`
-    #     (as a fraction of max capacity), the heuristic is skipped and RL decides
-    #     what to do next (e.g. build a city or head to deposit).
+        Exception: if the unit's cargo is already filled above `cargo_threshold`
+        (as a fraction of max capacity), the heuristic is skipped and RL decides
+        what to do next (e.g. build a city or head to deposit).
 
-    #     "Collectable" means the cell has a resource of a type that the
-    #     team has already researched (wood is always available; coal and
-    #     uranium require research points).
+        "Collectable" means the cell has a resource of a type that the
+        team has already researched (wood is always available; coal and
+        uranium require research points).
 
-    #     Args:
-    #         cargo_threshold: fraction of max cargo [0, 1] above which the
-    #                          heuristic is suppressed. Default 0.5 (half full).
-    #     """
-    #     if is_night:
-    #         return
+        Args:
+            cargo_threshold: fraction of max cargo [0, 1] above which the
+                             heuristic is suppressed. Default 0.5 (half full).
+        """
+        if is_night:
+            return
 
-    #     researched = game.state["teamStates"][self.team]["researched"]
+        researched = game.state["teamStates"][self.team]["researched"]
 
-    #     for unit_id, unit in game.state["teamStates"][self.team]["units"].items():
-    #         if unit.type != Constants.UNIT_TYPES.WORKER:
-    #             continue
-    #         if not unit.can_act():
-    #             continue
+        for unit_id, unit in game.state["teamStates"][self.team]["units"].items():
+            if unit.type != Constants.UNIT_TYPES.WORKER:
+                continue
+            if not unit.can_act():
+                continue
 
-    #         # If cargo is sufficiently full, let RL decide — skip heuristic
-    #         unit_type_key = "WORKER" if unit.type == Constants.UNIT_TYPES.WORKER else "CART"
-    #         max_cargo = GAME_CONSTANTS["PARAMETERS"]["RESOURCE_CAPACITY"][unit_type_key]
-    #         cargo_used = max_cargo - unit.get_cargo_space_left()
-    #         if cargo_used / max_cargo >= cargo_threshold:
-    #             continue
+            # If cargo is sufficiently full, let RL decide — skip heuristic
+            unit_type_key = "WORKER" if unit.type == Constants.UNIT_TYPES.WORKER else "CART"
+            max_cargo = GAME_CONSTANTS["PARAMETERS"]["RESOURCE_CAPACITY"][unit_type_key]
+            cargo_used = max_cargo - unit.get_cargo_space_left()
+            if cargo_used / max_cargo >= cargo_threshold:
+                continue
 
-    #         unit_cell = game.map.get_cell_by_pos(unit.pos)
-    #         # The 5 cells a worker can collect from: current + 4 adjacent
-    #         candidate_cells = [unit_cell] + game.map.get_adjacent_cells(unit_cell)
+            unit_cell = game.map.get_cell_by_pos(unit.pos)
+            # The 5 cells a worker can collect from: current + 4 adjacent
+            candidate_cells = [unit_cell] + game.map.get_adjacent_cells(unit_cell)
 
-    #         def is_collectable(cell):
-    #             """True if the cell has a resource the team can currently mine."""
-    #             if not cell.has_resource():
-    #                 return False
-    #             rtype = cell.resource.type
-    #             # Wood is always researchable; coal/uranium need research
-    #             if rtype == Constants.RESOURCE_TYPES.WOOD:
-    #                 return True
-    #             return bool(researched.get(rtype, False))
+            def is_collectable(cell):
+                """True if the cell has a resource the team can currently mine."""
+                if not cell.has_resource():
+                    return False
+                rtype = cell.resource.type
+                # Wood is always researchable; coal/uranium need research
+                if rtype == Constants.RESOURCE_TYPES.WOOD:
+                    return True
+                return bool(researched.get(rtype, False))
 
-    #         # Count how many of the 5 directions have a collectable resource
-    #         collectable_count = sum(1 for c in candidate_cells if is_collectable(c))
+            # Count how many of the 5 directions have a collectable resource
+            collectable_count = sum(1 for c in candidate_cells if is_collectable(c))
 
-    #         if collectable_count == len(candidate_cells):  # all 5 directions covered
-    #             action = MoveAction(
-    #                 team=self.team,
-    #                 unit_id=unit.id,
-    #                 direction=Constants.DIRECTIONS.CENTER,
-    #             )
-    #             self.match_controller.take_action(action)
+            if collectable_count == len(candidate_cells):  # all 5 directions covered
+                action = MoveAction(
+                    team=self.team,
+                    unit_id=unit.id,
+                    direction=Constants.DIRECTIONS.CENTER,
+                )
+                self.match_controller.take_action(action)
 
     def no_cart_without_worker_heuristic(self, game):
         """
@@ -1046,20 +924,24 @@ class AgentPolicy(AgentWithModel):
 
         In inference mode heuristic_prob is always 0.0 so RL runs unassisted.
         To adjust the decay speed, set `agent.heuristic_decay_scale` before
-        training (default 6000 games).
+        training (default 500 games).
 
         Args:
             game ([type]): Game in progress
             is_first_turn (bool): True if it's the first turn of a game.
         """
+        is_night = game.is_night()
         prob = getattr(self, "heuristic_prob", 1.0)
 
-        # Each heuristic is independently sampled so they can decay at the same
-        # rate but don't always activate together (adds stochasticity).
+        # Each heuristic is independently sampled so they decay at the same rate
+        # but don't always activate together (adds stochasticity to the curriculum).
+        # self.cargo_heuristic(game, is_first_turn, is_night=is_night)
+        # if random.random() < prob:
+        #     self.worker_collect_heuristic(game, is_night=is_night)
         if random.random() < prob:
             self.research_heuristic(game)
-        # no_cart_without_worker is now enforced via action masking in take_action(),
-        # so it no longer needs to be called here as a hard override.
+        if random.random() < prob:
+            self.no_cart_without_worker_heuristic(game)
         return
     
     
