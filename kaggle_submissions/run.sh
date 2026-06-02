@@ -3,6 +3,7 @@ cd ..
 cd .\e1\
 python train.py
 
+conda activate luxai
 cd ..
 cd .\e2\
 python train.py

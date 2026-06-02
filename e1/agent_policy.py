@@ -777,12 +777,17 @@ class AgentPolicy(AgentWithModel):
         # ═══════════════════════════════════════════════════════════════════════
         
         # Give a reward for unit creation/death. 0.05 reward per unit.
-        rewards["rew/r_units"] = (unit_count - self.units_last) * 0.25
+        rewards["rew/r_units"] = (unit_count - self.units_last) * 0.05
         self.units_last = unit_count
 
         # Give a reward for city creation/death. 0.1 reward per city.
-        rewards["rew/r_city_tiles"] = (city_tile_count - self.city_tiles_last) * 0.5
+        rewards["rew/r_city_tiles"] = (city_tile_count - self.city_tiles_last) * 0.1
         self.city_tiles_last = city_tile_count
+
+        # 简单采集奖励：每回合新增的燃料量
+        fuel_now = game.stats["teamStats"][self.team]["fuelGenerated"]
+        rewards["rew/r_collect"] = (fuel_now - self.fuel_collected_last) / 10000
+        self.fuel_collected_last = fuel_now
 
         # ═══════════════════════════════════════════════════════════════════════
         # 采集质量奖励：鼓励 unit 采集与当前研究等级匹配的资源
@@ -834,14 +839,31 @@ class AgentPolicy(AgentWithModel):
         # rewards["rew/r_cargo_quality"] = cargo_quality_reward
 
         # ═══════════════════════════════════════════════════════════════════════
-        # 不作为奖励：
         # ═══════════════════════════════════════════════════════════════════════
+        # 低效行为惩罚：惩罚"带货不干活"的 unit
+        # ═══════════════════════════════════════════════════════════════════════
+        #
+        # 惩罚条件：unit 的 cargo 不为空，但既不在资源格上（采集），
+        # 也不在城市格上（卸货/建城）。
+        # 即：带着资源在空地/道路上闲置，不推进任何有意义的目标。
+        #
+        # 不惩罚的情形（宽容）：
+        #   - cargo 为空（可能在移动去采集，允许）
+        #   - 站在资源格（正在采集）
+        #   - 站在 city_tile（卸货、建城、充能，均有意义）
+        #
         noop_reward = 0
+        cargo_capacity = GAME_CONSTANTS["PARAMETERS"]["RESOURCE_CAPACITY"]["WORKER"]
         for unit in game.state["teamStates"][self.team]["units"].values():
+            cargo_total = unit.cargo["wood"] + unit.cargo["coal"] + unit.cargo["uranium"]
+            if cargo_total == 0:
+                continue  # 空载，宽容
             cell = game.map.get_cell_by_pos(unit.pos)
-            if not cell.is_city_tile() and cell.road <= game.configs["parameters"]["MIN_ROAD"]:
-                # 格子既没有资源、不是城市、也没有道路 → 纯空地，给予惩罚
-                noop_reward -= 0.02
+            if cell.has_resource() or cell.is_city_tile():
+                continue  # 在采集或在城市，有意义
+            # 带货但在空地/道路上 → 惩罚，按 cargo 占比缩放
+            cargo_ratio = cargo_total / cargo_capacity
+            noop_reward -= 0.01 * cargo_ratio
         rewards["rew/r_noop_penalty"] = noop_reward
 
         # ═══════════════════════════════════════════════════════════════════════
@@ -852,7 +874,7 @@ class AgentPolicy(AgentWithModel):
         rewards["rew/r_city_tiles_end"] = 0
         if is_game_finished:
             self.is_last_turn = True
-            rewards["rew/r_city_tiles_end"] = city_tile_count * 0.2
+            rewards["rew/r_city_tiles_end"] = city_tile_count * 0.1
 
             '''
             # Example of a game win/loss reward instead

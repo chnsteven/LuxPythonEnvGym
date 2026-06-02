@@ -467,7 +467,7 @@ class AgentPolicy(AgentWithModel):
 
         return obs
 
- def get_action_mask(self, game, unit=None, city_tile=None):
+    def get_action_mask(self, game, unit=None, city_tile=None):
         """
         Computes a boolean action mask for the given unit or city tile.
 
@@ -610,9 +610,13 @@ class AgentPolicy(AgentWithModel):
         still enforcing hard constraints at execution time.
         """
         if mask[action_code % len(mask)]:
-            return action_code  # action is allowed, no change
+            return action_code  # allowed, no change
 
-        return action_code
+        # 被 mask 掉了，找第一个允许的动作
+        allowed = np.where(mask)[0]
+        if len(allowed) == 0:
+            return 0  # 全 False 时 fallback 到 do-nothing
+        return int(allowed[0])
 
     def action_code_to_action(self, action_code, game, unit=None, city_tile=None, team=None):
         """
@@ -773,81 +777,103 @@ class AgentPolicy(AgentWithModel):
         # ═══════════════════════════════════════════════════════════════════════
         
         # Give a reward for unit creation/death. 0.05 reward per unit.
-        rewards["rew/r_units"] = (unit_count - self.units_last) * 0.25
+        rewards["rew/r_units"] = (unit_count - self.units_last) * 0.05
         self.units_last = unit_count
 
         # Give a reward for city creation/death. 0.1 reward per city.
-        rewards["rew/r_city_tiles"] = (city_tile_count - self.city_tiles_last) * 0.5
+        rewards["rew/r_city_tiles"] = (city_tile_count - self.city_tiles_last) * 0.1
         self.city_tiles_last = city_tile_count
+
+        # 简单采集奖励：每回合新增的燃料量
+        fuel_now = game.stats["teamStats"][self.team]["fuelGenerated"]
+        rewards["rew/r_collect"] = (fuel_now - self.fuel_collected_last) / 10000
+        self.fuel_collected_last = fuel_now
 
         # ═══════════════════════════════════════════════════════════════════════
         # 采集质量奖励：鼓励 unit 采集与当前研究等级匹配的资源
         # ═══════════════════════════════════════════════════════════════════════
         #
         # 仅在 unit cargo 未满时触发（满了应该去建城，不给此奖励）。
-        # 根据本回合 cargo 净增量中比例最高的资源类型，给予对应奖励系数：
-        #   uranium（最高研究）: 1.0
-        #   coal（中级研究）:    0.5
-        #   wood（基础）:        0.25
+        # 根据本回合 cargo 净增量中比例最高的资源类型，给予对应奖励系数
         # 如果当前采集的资源不是已研究的最高等级，每少一级减半。
-        #
-        # cargo_quality_reward = 0.0
-        # noop_penalty = 0
-        # base_quality_reward = 0.05
-        # cargo_capacity = GAME_CONSTANTS["PARAMETERS"]["RESOURCE_CAPACITY"]["WORKER"]
+        
+        cargo_quality_reward = 0.0
+        noop_penalty = 0
+        base_quality_reward = 0.05
+        cargo_capacity = GAME_CONSTANTS["PARAMETERS"]["RESOURCE_CAPACITY"]["WORKER"]
 
-        # # 确定当前已研究的最高资源等级
-        # # uranium > coal > wood（每少一级奖励减半）
-        # researched_uranium = game.state["teamStates"][self.team]["researched"][Constants.RESOURCE_TYPES.URANIUM]
-        # researched_coal = game.state["teamStates"][self.team]["researched"][Constants.RESOURCE_TYPES.COAL]
+        # 确定当前已研究的最高资源等级
+        # uranium > coal > wood（每少一级奖励减半）
+        researched_uranium = game.state["teamStates"][self.team]["researched"][Constants.RESOURCE_TYPES.URANIUM]
+        researched_coal = game.state["teamStates"][self.team]["researched"][Constants.RESOURCE_TYPES.COAL]
 
-        # if researched_uranium:
-        #     tier_multipliers = {"uranium": base_quality_reward, "coal": base_quality_reward/2, "wood": base_quality_reward/4}
-        # elif researched_coal:
-        #     tier_multipliers = {"uranium": 0.0, "coal": base_quality_reward, "wood": base_quality_reward/2}
-        # else:
-        #     tier_multipliers = {"uranium": 0.0, "coal": 0.0, "wood": base_quality_reward}
+        if researched_uranium:
+            tier_multipliers = {"uranium": base_quality_reward, "coal": base_quality_reward/2, "wood": base_quality_reward/4}
+        elif researched_coal:
+            tier_multipliers = {"uranium": 0.0, "coal": base_quality_reward, "wood": base_quality_reward/2}
+        else:
+            tier_multipliers = {"uranium": 0.0, "coal": 0.0, "wood": base_quality_reward}
 
-        # for unit in game.state["teamStates"][self.team]["units"].values():
-        #     cargo = unit.cargo  # {"wood": int, "coal": int, "uranium": int}
-        #     cargo_total = cargo["wood"] + cargo["coal"] + cargo["uranium"]
-
-        #     # cargo 已满则跳过
-        #     if cargo_total >= cargo_capacity:
-        #         continue
-
-        #     # 用 unit 当前所在格的资源类型判断正在采集什么
-        #     cell = game.map.get_cell_by_pos(unit.pos)
-        #     if cell.has_resource():
-        #         resource_type = cell.resource.type  # "wood" / "coal" / "uranium"
-        #         multiplier = tier_multipliers.get(resource_type, 0.0)
-        #         if multiplier > 0.0:
-        #             cargo_quality_reward += multiplier
-        #     elif not cell.is_city_tile() and cell.road <= game.configs["parameters"]["MIN_ROAD"]:
-        #         # 格子既没有资源、不是城市、也没有道路 → 纯空地，给予惩罚
-        #         cargo_quality_reward -= 0.01
-
-        # rewards["rew/r_cargo_quality"] = cargo_quality_reward
-
-        # ═══════════════════════════════════════════════════════════════════════
-        # 不作为奖励：
-        # ═══════════════════════════════════════════════════════════════════════
-        noop_reward = 0
         for unit in game.state["teamStates"][self.team]["units"].values():
-            if not cell.is_city_tile() and cell.road <= game.configs["parameters"]["MIN_ROAD"]:
-                # 格子既没有资源、不是城市、也没有道路 → 纯空地，给予惩罚
-                noop_reward -= 0.02
-        rewards["rew/r_noop_penalty"] = noop_reward
+            cargo = unit.cargo  # {"wood": int, "coal": int, "uranium": int}
+            cargo_total = cargo["wood"] + cargo["coal"] + cargo["uranium"]
+
+            # cargo 已满则跳过
+            if cargo_total >= cargo_capacity:
+                continue
+
+            # 用 unit 当前所在格的资源类型判断正在采集什么
+            cell = game.map.get_cell_by_pos(unit.pos)
+            if cell.has_resource():
+                resource_type = cell.resource.type  # "wood" / "coal" / "uranium"
+                multiplier = tier_multipliers.get(resource_type, 0.0)
+                if multiplier > 0.0:
+                    cargo_quality_reward += multiplier
+            # elif not cell.is_city_tile() and cell.road <= game.configs["parameters"]["MIN_ROAD"]:
+            #     # 格子既没有资源、不是城市、也没有道路 → 纯空地，给予惩罚
+            #     cargo_quality_reward -= 0.01
+
+        rewards["rew/r_cargo_quality"] = cargo_quality_reward
+
+        # ═══════════════════════════════════════════════════════════════════════
+        # ═══════════════════════════════════════════════════════════════════════
+        # 低效行为惩罚：惩罚"带货不干活"的 unit
+        # ═══════════════════════════════════════════════════════════════════════
+        #
+        # 惩罚条件：unit 的 cargo 不为空，但既不在资源格上（采集），
+        # 也不在城市格上（卸货/建城）。
+        # 即：带着资源在空地/道路上闲置，不推进任何有意义的目标。
+        #
+        # 不惩罚的情形（宽容）：
+        #   - cargo 为空（可能在移动去采集，允许）
+        #   - 站在资源格（正在采集）
+        #   - 站在 city_tile（卸货、建城、充能，均有意义）
+        #
+        # noop_reward = 0
+        # cargo_capacity = GAME_CONSTANTS["PARAMETERS"]["RESOURCE_CAPACITY"]["WORKER"]
+        # for unit in game.state["teamStates"][self.team]["units"].values():
+        #     cargo_total = unit.cargo["wood"] + unit.cargo["coal"] + unit.cargo["uranium"]
+        #     if cargo_total == 0:
+        #         continue  # 空载，宽容
+        #     cell = game.map.get_cell_by_pos(unit.pos)
+        #     if cell.has_resource() or cell.is_city_tile():
+        #         continue  # 在采集或在城市，有意义
+        #     # 带货但在空地/道路上 → 惩罚，按 cargo 占比缩放
+        #     cargo_ratio = cargo_total / cargo_capacity
+        #     noop_reward -= 0.01 * cargo_ratio
+        # rewards["rew/r_noop_penalty"] = noop_reward
 
         # ═══════════════════════════════════════════════════════════════════════
         # 游戏结束奖励
         # ═══════════════════════════════════════════════════════════════════════
         
         # Give a reward of 1.0 per city tile alive at the end of the game
-        rewards["rew/r_city_tiles_end"] = 0
         if is_game_finished:
             self.is_last_turn = True
-            rewards["rew/r_city_tiles_end"] = city_tile_count * 0.2
+            # if city_tile_count > 0:
+            rewards["rew/r_survival"] = (worker_count + cart_count + city_tile_count) * 0.5
+            # else
+            #     rewards["rew/r_survival"] = -5.0  # Game lost
 
             '''
             # Example of a game win/loss reward instead
@@ -929,10 +955,6 @@ class AgentPolicy(AgentWithModel):
         """
         prob = getattr(self, "heuristic_prob", 1.0)
 
-        # Each heuristic is independently sampled so they can decay at the same
-        # rate but don't always activate together (adds stochasticity).
         # if random.random() < prob:
         self.research_heuristic(game)
-        # no_cart_without_worker is now enforced via action masking in take_action(),
-        # so it no longer needs to be called here as a hard override.
         return
