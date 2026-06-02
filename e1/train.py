@@ -64,7 +64,7 @@ def train(args):
     configs = LuxMatchConfigs_Default
 
     # Create a default opponent agent
-    opponent = AgentPolicy(mode="inference", model=PPO.load("../baseline/PPO_5/model.zip"))
+    # opponent = AgentPolicy(mode="inference", model=PPO.load("../baseline/PPO_5/model.zip"))
     opponent = Agent()
 
     # Create a RL agent in training mode
@@ -119,7 +119,7 @@ def train(args):
                                 replay_env=LuxEnvironment(
                                                 configs=configs,
                                                 learning_agent=player_replay,
-                                                opponent_agent=AgentPolicy(mode="inference", model=PPO.load("../baseline/PPO_5/model.zip"))
+                                                opponent_agent=Agent()
                                 ),
                                 replay_num_episodes=5
                             )
