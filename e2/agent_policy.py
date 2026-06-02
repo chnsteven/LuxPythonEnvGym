@@ -870,10 +870,10 @@ class AgentPolicy(AgentWithModel):
         # Give a reward of 1.0 per city tile alive at the end of the game
         if is_game_finished:
             self.is_last_turn = True
-            # if city_tile_count > 0:
-            rewards["rew/r_survival"] = (worker_count + cart_count + city_tile_count) * 0.5
-            # else
-            #     rewards["rew/r_survival"] = -5.0  # Game lost
+            if city_tile_count > 0:
+                rewards["rew/r_survival"] = (worker_count + cart_count + city_tile_count) * 0.5
+            else
+                rewards["rew/r_survival"] = -5.0  # Game lost
 
             '''
             # Example of a game win/loss reward instead
