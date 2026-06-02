@@ -45,7 +45,7 @@ def get_command_line_arguments():
     parser.add_argument('--gae_lambda', help='GAE Lambda', type=float, default=0.95)
     parser.add_argument('--batch_size', help='batch_size', type=int, default=1024)  # 64
     parser.add_argument('--step_count', help='Total number of steps to train', type=int, default=10000000)
-    parser.add_argument('--n_steps', help='Number of experiences to gather before each learning period', type=int, default=1024)
+    parser.add_argument('--n_steps', help='Number of experiences to gather before each learning period', type=int, default=2048)
     parser.add_argument('--path', help='Path to a checkpoint to load to resume training', type=str, default=None)
     parser.add_argument('--n_envs', help='Number of parallel environments to use in training', type=int, default=1)
     args = parser.parse_args()

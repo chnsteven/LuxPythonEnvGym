@@ -773,7 +773,7 @@ class AgentPolicy(AgentWithModel):
         rewards = {}
         
         # ═══════════════════════════════════════════════════════════════════════
-        # 中等优先级奖励：城市扩张和单位创建
+        # 城市扩张和单位创建
         # ═══════════════════════════════════════════════════════════════════════
         
         # Give a reward for unit creation/death. 0.05 reward per unit.
@@ -783,6 +783,10 @@ class AgentPolicy(AgentWithModel):
         # Give a reward for city creation/death. 0.1 reward per city.
         rewards["rew/r_city_tiles"] = (city_tile_count - self.city_tiles_last) * 0.1
         self.city_tiles_last = city_tile_count
+
+        # 每轮持续奖励：鼓励维持更多单位和城市
+        rewards["rew/r_units_alive"] = unit_count * 0.01
+        rewards["rew/r_city_tiles_alive"] = city_tile_count * 0.02
 
         # 简单采集奖励：每回合新增的燃料量
         fuel_now = game.stats["teamStats"][self.team]["fuelGenerated"]
@@ -798,8 +802,7 @@ class AgentPolicy(AgentWithModel):
         # 如果当前采集的资源不是已研究的最高等级，每少一级减半。
         
         cargo_quality_reward = 0.0
-        noop_penalty = 0
-        base_quality_reward = 0.05
+        base_quality_reward = 0.1
         cargo_capacity = GAME_CONSTANTS["PARAMETERS"]["RESOURCE_CAPACITY"]["WORKER"]
 
         # 确定当前已研究的最高资源等级
@@ -872,8 +875,8 @@ class AgentPolicy(AgentWithModel):
             self.is_last_turn = True
             if city_tile_count > 0:
                 rewards["rew/r_survival"] = (worker_count + cart_count + city_tile_count) * 0.5
-            else
-                rewards["rew/r_survival"] = -5.0  # Game lost
+            else:
+                rewards["rew/r_survival"] = -1.0  # Game lost
 
             '''
             # Example of a game win/loss reward instead
