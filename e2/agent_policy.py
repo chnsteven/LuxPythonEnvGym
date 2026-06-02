@@ -785,13 +785,24 @@ class AgentPolicy(AgentWithModel):
         self.city_tiles_last = city_tile_count
 
         # 每轮持续奖励：鼓励维持更多单位和城市
-        rewards["rew/r_units_alive"] = unit_count * 0.01
-        rewards["rew/r_city_tiles_alive"] = city_tile_count * 0.02
+        rewards["rew/r_units_alive"] = unit_count * 0.005
+        rewards["rew/r_city_tiles_alive"] = city_tile_count * 0.01
 
         # 简单采集奖励：每回合新增的燃料量
         fuel_now = game.stats["teamStats"][self.team]["fuelGenerated"]
         rewards["rew/r_collect"] = (fuel_now - self.fuel_collected_last) / 10000
         self.fuel_collected_last = fuel_now
+
+        # Cart 装载率奖励：鼓励 cart 保持高 cargo 占用率
+        cart_capacity = GAME_CONSTANTS["PARAMETERS"]["RESOURCE_CAPACITY"]["CART"]
+        cart_fill_total = 0.0
+        cart_count_actual = 0
+        for unit in game.state["teamStates"][self.team]["units"].values():
+            if unit.type == Constants.UNIT_TYPES.CART:
+                cargo_total = unit.cargo["wood"] + unit.cargo["coal"] + unit.cargo["uranium"]
+                cart_fill_total += cargo_total / cart_capacity
+                cart_count_actual += 1
+        rewards["rew/r_cart_fill"] = (cart_fill_total / cart_count_actual * 0.15) if cart_count_actual > 0 else 0.0
 
         # ═══════════════════════════════════════════════════════════════════════
         # 采集质量奖励：鼓励 unit 采集与当前研究等级匹配的资源
@@ -811,9 +822,9 @@ class AgentPolicy(AgentWithModel):
         researched_coal = game.state["teamStates"][self.team]["researched"][Constants.RESOURCE_TYPES.COAL]
 
         if researched_uranium:
-            tier_multipliers = {"uranium": base_quality_reward, "coal": base_quality_reward/2, "wood": base_quality_reward/4}
+            tier_multipliers = {"uranium": base_quality_reward, "coal": base_quality_reward/4, "wood": base_quality_reward/8}
         elif researched_coal:
-            tier_multipliers = {"uranium": 0.0, "coal": base_quality_reward, "wood": base_quality_reward/2}
+            tier_multipliers = {"uranium": 0.0, "coal": base_quality_reward, "wood": base_quality_reward/4}
         else:
             tier_multipliers = {"uranium": 0.0, "coal": 0.0, "wood": base_quality_reward}
 
@@ -874,7 +885,7 @@ class AgentPolicy(AgentWithModel):
         if is_game_finished:
             self.is_last_turn = True
             if city_tile_count > 0:
-                rewards["rew/r_survival"] = (worker_count + cart_count + city_tile_count) * 0.5
+                rewards["rew/r_survival"] = (worker_count + cart_count) * 0.5 + city_tile_count
             else:
                 rewards["rew/r_survival"] = -1.0  # Game lost
 
