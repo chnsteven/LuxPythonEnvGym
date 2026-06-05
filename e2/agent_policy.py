@@ -140,8 +140,12 @@ class AgentPolicy(AgentWithModel):
         # 1. 自身状态 (Self State) - 8 维
         #    [unit_type×3, pos×2, cargo×3]
         #
-        # 2. 资源信息 (Resources) - (Top-2 closest + Top-2 furthest) × 4 = 16 维
-        #    每个资源槽: [type_wood, type_coal, type_uranium, distance]
+        # 2. 资源信息 (Resources) - (Top-2 closest + Top-2 furthest) × 5 = 20 维
+        #    每个资源槽: [type_wood, type_coal, type_uranium, distance, val]
+        #    val = 采集优先度，归一化到已研究最高等级=1.0
+        #      仅有 wood:          wood=1.0, coal=0.0,  uranium=0.0
+        #      researched coal:    coal=1.0, wood=0.1,  uranium=0.0
+        #      researched uranium: uranium=1.0, coal=0.1, wood=0.025
         #
         # 3. 友方单位 (Friendly Units) - (Top-2 closest + Top-2 furthest) × 4 = 16 维
         #    每个单位槽: [type_worker, type_cart, distance, cargo_space_left]
@@ -161,9 +165,9 @@ class AgentPolicy(AgentWithModel):
         #     research_pts, coal_ok, uranium_ok]
         #
         # ═══════════════════════════════════════════════════════════════════════
-        # 总维度: 8 + 16 + 16 + 16 + 12 + 8 + 11 = 87 维
+        # 总维度: 8 + 20 + 16 + 16 + 12 + 8 + 11 = 91 维
         # ═══════════════════════════════════════════════════════════════════════
-        self.observation_shape = (87,)
+        self.observation_shape = (43,)
         self.observation_space = spaces.Box(low=0, high=1, shape=self.observation_shape, dtype=np.float16)
 
         self.object_nodes = {}
@@ -259,22 +263,6 @@ class AgentPolicy(AgentWithModel):
         pos = unit.pos if unit is not None else (city_tile.pos if city_tile is not None else None)
         pos_arr = np.array([pos.x, pos.y]) if pos is not None else None
 
-        # ── 辅助：从候选列表中取 top-2 closest + top-2 furthest ───────────────
-        def top2_close_far(items, key_dist):
-            """items: list of any, key_dist: callable(item)->float
-               返回 [close0, close1, far0, far1]，不足用 None 补齐"""
-            if not items:
-                return [None, None, None, None]
-            items_sorted = sorted(items, key=key_dist)
-            close = items_sorted[:2]
-            far   = list(reversed(items_sorted[-2:]))
-            # 如果 close 和 far 有重叠（items<=2），far 补 None
-            result = close + far
-            # pad
-            while len(result) < 4:
-                result.append(None)
-            return result[:4]
-
         # ── 1. 自身状态 (8维) ─────────────────────────────────────────────────
         if unit is not None:
             obs[idx]     = 1.0 if unit.type == Constants.UNIT_TYPES.WORKER else 0.0
@@ -295,99 +283,142 @@ class AgentPolicy(AgentWithModel):
             obs[idx + 2] = unit.cargo["uranium"] / cap
         idx += 3
 
-        # ── 2. 资源 Top-2 closest + Top-2 furthest (16维) ────────────────────
+        # ── 2. 资源 Top-1 closest + Top-1 furthest (10维) ────────────────────
         if pos_arr is not None:
-            resources = []
+            # 根据已研究等级确定各资源的采集优先度（val），归一化到最高已研究=1.0
+            researched_coal    = game.state["teamStates"][team]["researched"]["coal"]
+            researched_uranium = game.state["teamStates"][team]["researched"]["uranium"]
+            if researched_uranium:
+                resource_val = {
+                    Constants.RESOURCE_TYPES.URANIUM: 1.0,
+                    Constants.RESOURCE_TYPES.COAL:    0.1,
+                    Constants.RESOURCE_TYPES.WOOD:    0.025,
+                }
+            elif researched_coal:
+                resource_val = {
+                    Constants.RESOURCE_TYPES.COAL: 1.0,
+                    Constants.RESOURCE_TYPES.WOOD: 0.1,
+                    Constants.RESOURCE_TYPES.URANIUM: 0.0,
+                }
+            else:
+                resource_val = {
+                    Constants.RESOURCE_TYPES.WOOD:    1.0,
+                    Constants.RESOURCE_TYPES.COAL:    0.0,
+                    Constants.RESOURCE_TYPES.URANIUM: 0.0,
+                }
+
+            # 收集所有已研究资源节点
+            all_nodes = []
+            rtype_map = []
             for rtype in [Constants.RESOURCE_TYPES.WOOD,
                           Constants.RESOURCE_TYPES.COAL,
                           Constants.RESOURCE_TYPES.URANIUM]:
-                if rtype == Constants.RESOURCE_TYPES.COAL:
-                    if not game.state["teamStates"][team]["researched"]["coal"]:
-                        continue
-                elif rtype == Constants.RESOURCE_TYPES.URANIUM:
-                    if not game.state["teamStates"][team]["researched"]["uranium"]:
-                        continue
+                if rtype == Constants.RESOURCE_TYPES.COAL and not researched_coal:
+                    continue
+                if rtype == Constants.RESOURCE_TYPES.URANIUM and not researched_uranium:
+                    continue
                 if rtype not in self.object_nodes:
                     continue
                 nodes = self.object_nodes[rtype]
-                dists = np.sum((nodes - pos_arr) ** 2, axis=1) ** 0.5
-                for i in range(len(nodes)):
-                    resources.append((dists[i], rtype))
+                for node in nodes:
+                    all_nodes.append(node)
+                    rtype_map.append(rtype)
 
-            slots = top2_close_far(resources, key_dist=lambda x: x[0])
-            for slot in slots:
-                if slot is not None:
-                    dist, rtype = slot
-                    if rtype == Constants.RESOURCE_TYPES.WOOD:
-                        obs[idx]     = 1.0
-                    elif rtype == Constants.RESOURCE_TYPES.COAL:
-                        obs[idx + 1] = 1.0
-                    elif rtype == Constants.RESOURCE_TYPES.URANIUM:
-                        obs[idx + 2] = 1.0
-                    obs[idx + 3] = dist / self.max_distance
-                idx += 4
+            def fill_resource_slot(node, rtype):
+                dist = ((node - pos_arr) ** 2).sum() ** 0.5
+                if rtype == Constants.RESOURCE_TYPES.WOOD:
+                    obs[idx]     = 1.0
+                elif rtype == Constants.RESOURCE_TYPES.COAL:
+                    obs[idx + 1] = 1.0
+                elif rtype == Constants.RESOURCE_TYPES.URANIUM:
+                    obs[idx + 2] = 1.0
+                obs[idx + 3] = dist / self.max_distance
+                obs[idx + 4] = resource_val.get(rtype, 0.0)
+
+            if all_nodes:
+                nodes_arr = np.array(all_nodes)
+                ci = closest_node(pos_arr, nodes_arr)
+                fi = furthest_node(pos_arr, nodes_arr)
+                fill_resource_slot(all_nodes[ci], rtype_map[ci])
+                idx += 5
+                fill_resource_slot(all_nodes[fi], rtype_map[fi])
+                idx += 5
+            else:
+                idx += 10
         else:
-            idx += 16
+            idx += 10
 
-        # ── 3. 友方单位 Top-2 closest + Top-2 furthest (16维) ────────────────
+        # ── 3. 友方单位 Top-1 closest + Top-1 furthest (8维) ─────────────────
         if pos_arr is not None:
-            friendly_units = []
+            friendly_nodes = []
+            friendly_utypes = []
+            friendly_cargo_lefts = []
             for utype in [Constants.UNIT_TYPES.WORKER, Constants.UNIT_TYPES.CART]:
                 key = str(utype)
                 if key not in self.object_nodes:
                     continue
                 nodes = self.object_nodes[key]
                 for node in nodes:
-                    node_pos = Position(node[0], node[1])
                     if unit is not None and node[0] == pos.x and node[1] == pos.y:
                         continue  # 排除自己
-                    dist = ((node - pos_arr) ** 2).sum() ** 0.5
+                    node_pos = Position(node[0], node[1])
                     cell = game.map.get_cell_by_pos(node_pos)
                     cargo_left = next(iter(cell.units.values())).get_cargo_space_left() if cell.units else self.cargo_capacity
-                    friendly_units.append((dist, utype, cargo_left))
+                    friendly_nodes.append(node)
+                    friendly_utypes.append(utype)
+                    friendly_cargo_lefts.append(cargo_left)
 
-            slots = top2_close_far(friendly_units, key_dist=lambda x: x[0])
-            for slot in slots:
-                if slot is not None:
-                    dist, utype, cargo_left = slot
-                    obs[idx]     = 1.0 if utype == Constants.UNIT_TYPES.WORKER else 0.0
-                    obs[idx + 1] = 1.0 if utype == Constants.UNIT_TYPES.CART   else 0.0
-                    obs[idx + 2] = dist / self.max_distance
-                    obs[idx + 3] = cargo_left / self.cargo_capacity
+            def fill_unit_slot(i):
+                node = friendly_nodes[i]
+                dist = ((node - pos_arr) ** 2).sum() ** 0.5
+                obs[idx]     = 1.0 if friendly_utypes[i] == Constants.UNIT_TYPES.WORKER else 0.0
+                obs[idx + 1] = 1.0 if friendly_utypes[i] == Constants.UNIT_TYPES.CART   else 0.0
+                obs[idx + 2] = dist / self.max_distance
+                obs[idx + 3] = friendly_cargo_lefts[i] / self.cargo_capacity
+
+            if friendly_nodes:
+                nodes_arr = np.array(friendly_nodes)
+                ci = closest_node(pos_arr, nodes_arr)
+                fi = furthest_node(pos_arr, nodes_arr)
+                fill_unit_slot(ci)
                 idx += 4
+                fill_unit_slot(fi)
+                idx += 4
+            else:
+                idx += 8
         else:
-            idx += 16
+            idx += 8
 
         # ── 4. 敌方单位 Top-2 closest + Top-2 furthest (16维) ────────────────
-        if pos_arr is not None:
-            enemy_units = []
-            for utype in [Constants.UNIT_TYPES.WORKER, Constants.UNIT_TYPES.CART]:
-                key = str(utype) + "_opponent"
-                if key not in self.object_nodes:
-                    continue
-                nodes = self.object_nodes[key]
-                for node in nodes:
-                    node_pos = Position(node[0], node[1])
-                    dist = ((node - pos_arr) ** 2).sum() ** 0.5
-                    cell = game.map.get_cell_by_pos(node_pos)
-                    cargo_left = next(iter(cell.units.values())).get_cargo_space_left() if cell.units else self.cargo_capacity
-                    enemy_units.append((dist, utype, cargo_left))
+        # if pos_arr is not None:
+        #     enemy_units = []
+        #     for utype in [Constants.UNIT_TYPES.WORKER, Constants.UNIT_TYPES.CART]:
+        #         key = str(utype) + "_opponent"
+        #         if key not in self.object_nodes:
+        #             continue
+        #         nodes = self.object_nodes[key]
+        #         for node in nodes:
+        #             node_pos = Position(node[0], node[1])
+        #             dist = ((node - pos_arr) ** 2).sum() ** 0.5
+        #             cell = game.map.get_cell_by_pos(node_pos)
+        #             cargo_left = next(iter(cell.units.values())).get_cargo_space_left() if cell.units else self.cargo_capacity
+        #             enemy_units.append((dist, utype, cargo_left))
 
-            slots = top2_close_far(enemy_units, key_dist=lambda x: x[0])
-            for slot in slots:
-                if slot is not None:
-                    dist, utype, cargo_left = slot
-                    obs[idx]     = 1.0 if utype == Constants.UNIT_TYPES.WORKER else 0.0
-                    obs[idx + 1] = 1.0 if utype == Constants.UNIT_TYPES.CART   else 0.0
-                    obs[idx + 2] = dist / self.max_distance
-                    obs[idx + 3] = cargo_left / self.cargo_capacity
-                idx += 4
-        else:
-            idx += 16
+        #     slots = top2_close_far(enemy_units, key_dist=lambda x: x[0])
+        #     for slot in slots:
+        #         if slot is not None:
+        #             dist, utype, cargo_left = slot
+        #             obs[idx]     = 1.0 if utype == Constants.UNIT_TYPES.WORKER else 0.0
+        #             obs[idx + 1] = 1.0 if utype == Constants.UNIT_TYPES.CART   else 0.0
+        #             obs[idx + 2] = dist / self.max_distance
+        #             obs[idx + 3] = cargo_left / self.cargo_capacity
+        #         idx += 4
+        # else:
+        #     idx += 16
 
-        # ── 5. 友方城市 Top-2 closest + Top-2 furthest (12维) ────────────────
+        # ── 5. 友方城市 Top-1 closest + Top-1 furthest (6维) ─────────────────
         if pos_arr is not None:
-            friendly_cities = []
+            city_data = []  # (dist, fuel_eff, fuel_surv, tile_coords)
             for city in game.cities.values():
                 if city.team != team:
                     continue
@@ -399,40 +430,48 @@ class AgentPolicy(AgentWithModel):
                 default_upkeep = len(city.city_cells) * GAME_CONSTANTS["PARAMETERS"]["LIGHT_UPKEEP"]["CITY"]
                 fuel_eff  = upkeep / default_upkeep if default_upkeep > 0 else 1.0
                 fuel_surv = min(city.fuel / (upkeep * self.nights_left), 1.0) if upkeep > 0 else 1.0
-                friendly_cities.append((dist, fuel_eff, fuel_surv))
+                city_data.append((dist, fuel_eff, fuel_surv))
 
-            slots = top2_close_far(friendly_cities, key_dist=lambda x: x[0])
-            for slot in slots:
-                if slot is not None:
-                    dist, fuel_eff, fuel_surv = slot
-                    obs[idx]     = dist / self.max_distance
-                    obs[idx + 1] = fuel_eff
-                    obs[idx + 2] = fuel_surv
+            def fill_city_slot(item):
+                dist, fuel_eff, fuel_surv = item
+                obs[idx]     = dist / self.max_distance
+                obs[idx + 1] = fuel_eff
+                obs[idx + 2] = fuel_surv
+
+            if city_data:
+                city_dists = np.array([c[0] for c in city_data]).reshape(-1, 1)
+                ci = closest_node(np.array([[0.0]]), city_dists)   # index of min dist
+                fi = furthest_node(np.array([[0.0]]), city_dists)  # index of max dist
+                fill_city_slot(city_data[ci])
                 idx += 3
+                fill_city_slot(city_data[fi])
+                idx += 3
+            else:
+                idx += 6
         else:
-            idx += 12
+            idx += 6
 
         # ── 6. 敌方城市 Top-2 closest + Top-2 furthest (8维) ─────────────────
-        if pos_arr is not None:
-            opponent_team = (team + 1) % 2
-            enemy_cities = []
-            for city in game.cities.values():
-                if city.team != opponent_team:
-                    continue
-                tile_coords = np.array([[c.pos.x, c.pos.y] for c in city.city_cells])
-                ci   = closest_node(pos_arr, tile_coords)
-                dist = ((tile_coords[ci] - pos_arr) ** 2).sum() ** 0.5
-                enemy_cities.append((dist, len(city.city_cells)))
+        # if pos_arr is not None:
+        #     opponent_team = (team + 1) % 2
+        #     enemy_cities = []
+        #     for city in game.cities.values():
+        #         if city.team != opponent_team:
+        #             continue
+        #         tile_coords = np.array([[c.pos.x, c.pos.y] for c in city.city_cells])
+        #         ci   = closest_node(pos_arr, tile_coords)
+        #         dist = ((tile_coords[ci] - pos_arr) ** 2).sum() ** 0.5
+        #         enemy_cities.append((dist, len(city.city_cells)))
 
-            slots = top2_close_far(enemy_cities, key_dist=lambda x: x[0])
-            for slot in slots:
-                if slot is not None:
-                    dist, tile_count = slot
-                    obs[idx]     = dist / self.max_distance
-                    obs[idx + 1] = tile_count / self.max_city_tiles
-                idx += 2
-        else:
-            idx += 8
+        #     slots = top2_close_far(enemy_cities, key_dist=lambda x: x[0])
+        #     for slot in slots:
+        #         if slot is not None:
+        #             dist, tile_count = slot
+        #             obs[idx]     = dist / self.max_distance
+        #             obs[idx + 1] = tile_count / self.max_city_tiles
+        #         idx += 2
+        # else:
+        #     idx += 8
 
         # ── 7. 全局信息 (11维) ────────────────────────────────────────────────
         obs[idx] = float(game.is_night());  idx += 1
@@ -539,12 +578,14 @@ class AgentPolicy(AgentWithModel):
             n = len(self.actions_units)
             mask = np.ones(n, dtype=bool)
 
+            mask[8] = False
+
             if unit is None:
                 return mask
 
-            # ── Mask: unit in cooldown → only CENTER (do-nothing) allowed ─────
+            # ── Mask: unit in cooldown ─────
             if not unit.can_act():
-                return np.array([True, False, False, False, False, False, False, False, False], dtype=bool)
+                return np.zeros(n, dtype=bool)
 
             pos = unit.pos
 
@@ -602,21 +643,18 @@ class AgentPolicy(AgentWithModel):
 
     def apply_mask(self, action_code, mask):
         """
-        If the RL-chosen action_code is forbidden by the mask, redirect to
-        the lowest-index allowed action.  If the mask is all-False (should
-        never happen in practice), return action_code unchanged.
+        If the chosen action_code is allowed by the mask, return it unchanged.
+        If forbidden, find the first allowed action and return it.
+        If the mask is all-False (e.g. city tile in cooldown), return None
+        to signal that no action should be taken this turn.
 
-        This keeps the RL obs→action sample intact in the replay buffer while
-        still enforcing hard constraints at execution time.
+        Always returns int or None — never raises.
         """
-        if mask[action_code % len(mask)]:
+        n = len(mask)
+        if mask[action_code % n]:
             return action_code  # allowed, no change
 
-        # 被 mask 掉了，找第一个允许的动作
-        allowed = np.where(mask)[0]
-        if len(allowed) == 0:
-            return 0  # 全 False 时 fallback 到 do-nothing
-        return int(allowed[0])
+        return None
 
     def action_code_to_action(self, action_code, game, unit=None, city_tile=None, team=None):
         """
@@ -677,7 +715,27 @@ class AgentPolicy(AgentWithModel):
         """
         # Apply hard-constraint mask: redirect forbidden actions to a safe one
         mask = self.get_action_mask(game, unit=unit, city_tile=city_tile)
+        original_action_code = action_code
         action_code = self.apply_mask(action_code, mask)
+
+        if action_code is None:
+            return  # all actions masked for this entity, skip entirely
+
+        # print(
+        #     "\n"
+        #     "================ ACTION MASK DEBUG ================\n"
+        #     f"Entity Type          : {'CityTile' if city_tile is not None else 'Unit'}\n"
+        #     f"Entity ID            : {city_tile.city_id if city_tile is not None else unit.id}\n"
+        #     f"Position             : ({city_tile.pos.x if city_tile is not None else unit.pos.x}, "
+        #     f"{city_tile.pos.y if city_tile is not None else unit.pos.y})\n"
+        #     f"Original Action Code : {original_action_code}\n"
+        #     f"Masked Action Code   : {action_code}\n"
+        #     f"Action Changed       : {original_action_code != action_code}\n"
+        #     f"Valid Actions        : {[i for i, v in enumerate(mask) if v]}\n"
+        #     f"Invalid Actions      : {[i for i, v in enumerate(mask) if not v]}\n"
+        #     f"Mask                 : {mask}\n"
+        #     "===================================================\n"
+        # )
 
         action = self.action_code_to_action(action_code, game, unit, city_tile, team)
         self.match_controller.take_action(action)
@@ -707,19 +765,6 @@ class AgentPolicy(AgentWithModel):
         self.carts_last = 0
         self.cities_last = 0  # 城市数量（不是 tile 数量）
 
-        # ── Heuristic Curriculum ──────────────────────────────────────────────
-        # 每局游戏开始时累加局数计数器，用于指数衰减 heuristic 介入概率。
-        # 仅在训练模式下生效；推理模式下 heuristic_prob 固定为 0（完全由 RL 决策）。
-        #
-        # 衰减公式：heuristic_prob = exp(-games_played / decay_scale)
-        #
-        # 校准基准（10M steps，每局约 360 steps → 约 27800 局）：
-        #   decay_scale=6000  → 训练结束时 prob ≈ 0.01（推荐）
-        #   decay_scale=10000 → 训练结束时 prob ≈ 0.06（更保守，退出更慢）
-        #
-        # 若训练 step 数不同，可在训练前覆盖：
-        #   player.heuristic_decay_scale = total_steps / steps_per_game / 4.6
-        #   （4.6 ≈ -ln(0.01)，使训练结束时 prob 恰好降至 1%）
         if self.mode == "train":
             self._heuristic_games_played = getattr(self, "_heuristic_games_played", 0) + 1
             decay_scale = getattr(self, "heuristic_decay_scale", 6000)
@@ -785,8 +830,8 @@ class AgentPolicy(AgentWithModel):
         self.city_tiles_last = city_tile_count
 
         # 每轮持续奖励：鼓励维持更多单位和城市
-        rewards["rew/r_units_alive"] = unit_count * 0.005
-        rewards["rew/r_city_tiles_alive"] = city_tile_count * 0.01
+        rewards["rew/r_units_alive"] = unit_count * 0.02
+        rewards["rew/r_city_tiles_alive"] = city_tile_count * 0.04
 
         # 简单采集奖励：每回合新增的燃料量
         fuel_now = game.stats["teamStats"][self.team]["fuelGenerated"]
@@ -848,34 +893,6 @@ class AgentPolicy(AgentWithModel):
             #     cargo_quality_reward -= 0.01
 
         rewards["rew/r_cargo_quality"] = cargo_quality_reward
-
-        # ═══════════════════════════════════════════════════════════════════════
-        # ═══════════════════════════════════════════════════════════════════════
-        # 低效行为惩罚：惩罚"带货不干活"的 unit
-        # ═══════════════════════════════════════════════════════════════════════
-        #
-        # 惩罚条件：unit 的 cargo 不为空，但既不在资源格上（采集），
-        # 也不在城市格上（卸货/建城）。
-        # 即：带着资源在空地/道路上闲置，不推进任何有意义的目标。
-        #
-        # 不惩罚的情形（宽容）：
-        #   - cargo 为空（可能在移动去采集，允许）
-        #   - 站在资源格（正在采集）
-        #   - 站在 city_tile（卸货、建城、充能，均有意义）
-        #
-        # noop_reward = 0
-        # cargo_capacity = GAME_CONSTANTS["PARAMETERS"]["RESOURCE_CAPACITY"]["WORKER"]
-        # for unit in game.state["teamStates"][self.team]["units"].values():
-        #     cargo_total = unit.cargo["wood"] + unit.cargo["coal"] + unit.cargo["uranium"]
-        #     if cargo_total == 0:
-        #         continue  # 空载，宽容
-        #     cell = game.map.get_cell_by_pos(unit.pos)
-        #     if cell.has_resource() or cell.is_city_tile():
-        #         continue  # 在采集或在城市，有意义
-        #     # 带货但在空地/道路上 → 惩罚，按 cargo 占比缩放
-        #     cargo_ratio = cargo_total / cargo_capacity
-        #     noop_reward -= 0.01 * cargo_ratio
-        # rewards["rew/r_noop_penalty"] = noop_reward
 
         # ═══════════════════════════════════════════════════════════════════════
         # 游戏结束奖励
@@ -953,15 +970,6 @@ class AgentPolicy(AgentWithModel):
         This is called pre-observation actions to allow for hardcoded heuristics
         to control a subset of units. Any unit or city that gets an action from this
         callback, will not create an observation+action.
-
-        Each heuristic is gated by `heuristic_prob` (set in game_start), which
-        decays exponentially over training games so that RL gradually takes over:
-
-            heuristic_prob = exp(-games_played / heuristic_decay_scale)
-
-        In inference mode heuristic_prob is always 0.0 so RL runs unassisted.
-        To adjust the decay speed, set `agent.heuristic_decay_scale` before
-        training (default 6000 games).
 
         Args:
             game ([type]): Game in progress
