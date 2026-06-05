@@ -1,12 +1,12 @@
 conda activate luxai
 cd ..
 cd .\e1\
-python train.py
+python train.py --n_envs 4
 
 conda activate luxai
 cd ..
 cd .\e2\
-python train.py
+python train.py --n_envs 2
 
 conda activate luxai
 cd ..

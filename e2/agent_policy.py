@@ -764,6 +764,9 @@ class AgentPolicy(AgentWithModel):
         self.workers_last = 0
         self.carts_last = 0
         self.cities_last = 0  # 城市数量（不是 tile 数量）
+        # 满资源滞留惩罚：记录每个 unit 连续满资源的回合数
+        # {unit_id: int}  0 表示当前未满或刚满第一轮（无惩罚）
+        self.unit_full_cargo_turns = {}
 
         if self.mode == "train":
             self._heuristic_games_played = getattr(self, "_heuristic_games_played", 0) + 1
@@ -830,8 +833,8 @@ class AgentPolicy(AgentWithModel):
         self.city_tiles_last = city_tile_count
 
         # 每轮持续奖励：鼓励维持更多单位和城市
-        rewards["rew/r_units_alive"] = unit_count * 0.02
-        rewards["rew/r_city_tiles_alive"] = city_tile_count * 0.04
+        rewards["rew/r_units_alive"] = unit_count * 0.01
+        rewards["rew/r_city_tiles_alive"] = city_tile_count * 0.02
 
         # 简单采集奖励：每回合新增的燃料量
         fuel_now = game.stats["teamStats"][self.team]["fuelGenerated"]
@@ -893,6 +896,56 @@ class AgentPolicy(AgentWithModel):
             #     cargo_quality_reward -= 0.01
 
         rewards["rew/r_cargo_quality"] = cargo_quality_reward
+
+        # ═══════════════════════════════════════════════════════════════════════
+        # 满资源滞留惩罚：鼓励 worker 及时卸货，而不是满载停滞
+        # ═══════════════════════════════════════════════════════════════════════
+        #
+        # 当 worker 的 cargo 达到上限时，计数器 +1（第一轮满载时初始化为 1）。
+        # 惩罚 = -penalty_per_turn * counter，随持续回合数线性递增。
+        # 一旦 cargo 不再满（已卸货 / 已建城），计数器重置为 0。
+        # cart 的满载奖励逻辑方向相反，不参与此惩罚。
+        # ═══════════════════════════════════════════════════════════════════════
+        # 宽限期 = worker 的 cooldown 轮数（从 game_constants 读取），期间不施加任何惩罚。
+        # 超出宽限期的额外等待轮数记为 excess，惩罚按 excess^1.5 非线性递增：
+        #   penalty = -base * excess^exponent
+        # 示例（base=0.02, exp=1.5）：
+        #   excess=0 (宽限内) → 0
+        #   excess=1           → -0.020
+        #   excess=2           → -0.057
+        #   excess=3           → -0.104
+        #   excess=5           → -0.224
+        worker_cooldown  = GAME_CONSTANTS["PARAMETERS"]["UNIT_ACTION_COOLDOWN"]["WORKER"]  # 2
+        penalty_base     = 0.01
+        penalty_exponent = 1.25
+        full_cargo_penalty = 0.0
+
+        current_unit_ids = set(game.state["teamStates"][self.team]["units"].keys())
+
+        # 清理已消失 unit 的计数器
+        stale_ids = [uid for uid in self.unit_full_cargo_turns if uid not in current_unit_ids]
+        for uid in stale_ids:
+            del self.unit_full_cargo_turns[uid]
+
+        for unit in game.state["teamStates"][self.team]["units"].values():
+            if unit.type != Constants.UNIT_TYPES.WORKER:
+                continue  # 仅对 worker 施加惩罚
+
+            cargo_total = unit.cargo["wood"] + unit.cargo["coal"] + unit.cargo["uranium"]
+            is_full = cargo_total >= cargo_capacity  # cargo_capacity 在上方已赋值
+
+            if is_full:
+                # 计数器累加（首次满载时从 1 开始）
+                self.unit_full_cargo_turns[unit.id] = self.unit_full_cargo_turns.get(unit.id, 0) + 1
+                turns_full = self.unit_full_cargo_turns[unit.id]
+                excess = turns_full - worker_cooldown  # 超出宽限期的轮数
+                if excess > 0:
+                    full_cargo_penalty -= penalty_base * (excess ** penalty_exponent)
+            else:
+                # cargo 不满，重置计数器
+                self.unit_full_cargo_turns[unit.id] = 0
+
+        rewards["rew/r_full_cargo_penalty"] = full_cargo_penalty
 
         # ═══════════════════════════════════════════════════════════════════════
         # 游戏结束奖励
