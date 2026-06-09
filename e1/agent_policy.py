@@ -12,6 +12,7 @@ from luxai2021.env.agent import Agent, AgentWithModel
 from luxai2021.game.actions import *
 from luxai2021.game.game_constants import GAME_CONSTANTS
 from luxai2021.game.position import Position
+from reward_policy import ConfigurableRewardPolicy
 
 
 # https://codereview.stackexchange.com/questions/28207/finding-the-closest-point-to-a-list-of-points
@@ -750,23 +751,10 @@ class AgentPolicy(AgentWithModel):
         Args:
             game ([type]): Game.
         """
-        self.units_last = 0
-        self.city_tiles_last = 0
-        self.fuel_collected_last = 0
-        # upkeep 效率追踪：记录上一回合城市总 fuel，用于计算净消耗
-        self.city_fuel_last = 0
-        # cooldown 追踪：记录上一回合各单位的 cooldown 值，用于检测溢出
-        self.unit_cooldowns_last = {}  # {unit_id: cooldown}
-        # research 状态追踪：记录上一回合的解锁状态，用于检测新资源解锁
-        self.researched_coal_last = False
-        self.researched_uranium_last = False
-        # 生存追踪：记录上一回合的单位和城市数量，用于计算生存奖励
-        self.workers_last = 0
-        self.carts_last = 0
-        self.cities_last = 0  # 城市数量（不是 tile 数量）
-        # 满资源滞留惩罚：记录每个 unit 连续满资源的回合数
-        # {unit_id: int}  0 表示当前未满或刚满第一轮（无惩罚）
-        self.unit_full_cargo_turns = {}
+        # 初始化奖励策略，并触发其每局重置
+        if not hasattr(self, "reward_policy"):
+            self.reward_policy = ConfigurableRewardPolicy()
+        self.reward_policy.game_start(game, self.team)
 
         if self.mode == "train":
             self._heuristic_games_played = getattr(self, "_heuristic_games_played", 0) + 1
@@ -780,198 +768,11 @@ class AgentPolicy(AgentWithModel):
         """
         Returns the reward function for this step of the game. Reward should be a
         delta increment to the reward, not the total current reward.
+        Delegates entirely to ConfigurableRewardPolicy in reward_policy.py.
         """
-        if is_game_error:
-            # Game environment step failed, assign a game lost reward to not incentivise this
-            print("Game failed due to error")
-            return -1.0
-
-        if not is_new_turn and not is_game_finished:
-            # Only apply rewards at the start of each turn or at game end
-            return 0
-
-        # Get some basic stats
-        unit_count = len(game.state["teamStates"][self.team]["units"])
-
-        city_count = 0
-        city_count_opponent = 0
-        city_tile_count = 0
-        city_tile_count_opponent = 0
-        for city in game.cities.values():
-            if city.team == self.team:
-                city_count += 1
-            else:
-                city_count_opponent += 1
-
-            for cell in city.city_cells:
-                if city.team == self.team:
-                    city_tile_count += 1
-                else:
-                    city_tile_count_opponent += 1
-        
-        # 统计单位类型数量
-        worker_count = 0
-        cart_count = 0
-        for unit in game.state["teamStates"][self.team]["units"].values():
-            if unit.type == Constants.UNIT_TYPES.WORKER:
-                worker_count += 1
-            else:
-                cart_count += 1
-        
-        rewards = {}
-        
-        # ═══════════════════════════════════════════════════════════════════════
-        # 城市扩张和单位创建
-        # ═══════════════════════════════════════════════════════════════════════
-        
-        # Give a reward for unit creation/death. 0.05 reward per unit.
-        rewards["rew/r_units"] = (unit_count - self.units_last) * 0.05
-        self.units_last = unit_count
-
-        # Give a reward for city creation/death. 0.1 reward per city.
-        rewards["rew/r_city_tiles"] = (city_tile_count - self.city_tiles_last) * 0.15
-        self.city_tiles_last = city_tile_count
-
-        # 每轮持续奖励：鼓励维持更多单位和城市
-        rewards["rew/r_units_alive"] = unit_count * 0.02
-        rewards["rew/r_city_tiles_alive"] = city_tile_count * 0.03
-
-        # 简单采集奖励：每回合新增的燃料量
-        fuel_now = game.stats["teamStats"][self.team]["fuelGenerated"]
-        rewards["rew/r_collect"] = (fuel_now - self.fuel_collected_last) / 10000
-        self.fuel_collected_last = fuel_now
-
-        # Cart 装载率奖励：鼓励 cart 保持高 cargo 占用率
-        cart_capacity = GAME_CONSTANTS["PARAMETERS"]["RESOURCE_CAPACITY"]["CART"]
-        cart_fill_total = 0.0
-        cart_count_actual = 0
-        for unit in game.state["teamStates"][self.team]["units"].values():
-            if unit.type == Constants.UNIT_TYPES.CART:
-                cargo_total = unit.cargo["wood"] + unit.cargo["coal"] + unit.cargo["uranium"]
-                cart_fill_total += cargo_total / cart_capacity
-                cart_count_actual += 1
-        rewards["rew/r_cart_fill"] = (cart_fill_total / cart_count_actual * 0.15) if cart_count_actual > 0 else 0.0
-
-        # ═══════════════════════════════════════════════════════════════════════
-        # 采集质量奖励：鼓励 unit 采集与当前研究等级匹配的资源
-        # ═══════════════════════════════════════════════════════════════════════
-        #
-        # 仅在 unit cargo 未满时触发（满了应该去建城，不给此奖励）。
-        # 根据本回合 cargo 净增量中比例最高的资源类型，给予对应奖励系数
-        # 如果当前采集的资源不是已研究的最高等级，每少一级减半。
-        
-        cargo_quality_reward = 0.0
-        base_quality_reward = 0.05
-        cargo_capacity = GAME_CONSTANTS["PARAMETERS"]["RESOURCE_CAPACITY"]["WORKER"]
-
-        # 确定当前已研究的最高资源等级
-        # uranium > coal > wood（每少一级奖励减半）
-        researched_uranium = game.state["teamStates"][self.team]["researched"][Constants.RESOURCE_TYPES.URANIUM]
-        researched_coal = game.state["teamStates"][self.team]["researched"][Constants.RESOURCE_TYPES.COAL]
-
-        if researched_uranium:
-            tier_multipliers = {"uranium": base_quality_reward, "coal": base_quality_reward/4, "wood": base_quality_reward/8}
-        elif researched_coal:
-            tier_multipliers = {"uranium": 0.0, "coal": base_quality_reward, "wood": base_quality_reward/4}
-        else:
-            tier_multipliers = {"uranium": 0.0, "coal": 0.0, "wood": base_quality_reward}
-
-        for unit in game.state["teamStates"][self.team]["units"].values():
-            cargo = unit.cargo  # {"wood": int, "coal": int, "uranium": int}
-            cargo_total = cargo["wood"] + cargo["coal"] + cargo["uranium"]
-
-            # cargo 已满则跳过
-            if cargo_total >= cargo_capacity:
-                continue
-
-            # 用 unit 当前所在格的资源类型判断正在采集什么
-            cell = game.map.get_cell_by_pos(unit.pos)
-            if cell.has_resource():
-                resource_type = cell.resource.type  # "wood" / "coal" / "uranium"
-                multiplier = tier_multipliers.get(resource_type, 0.0)
-                if multiplier > 0.0:
-                    cargo_quality_reward += multiplier
-            # elif not cell.is_city_tile() and cell.road <= game.configs["parameters"]["MIN_ROAD"]:
-            #     # 格子既没有资源、不是城市、也没有道路 → 纯空地，给予惩罚
-            #     cargo_quality_reward -= 0.01
-
-        rewards["rew/r_cargo_quality"] = cargo_quality_reward
-
-        # ═══════════════════════════════════════════════════════════════════════
-        # 满资源滞留惩罚：鼓励 worker 及时卸货，而不是满载停滞
-        # ═══════════════════════════════════════════════════════════════════════
-        #
-        # 当 worker 的 cargo 达到上限时，计数器 +1（第一轮满载时初始化为 1）。
-        # 惩罚 = -penalty_per_turn * counter，随持续回合数线性递增。
-        # 一旦 cargo 不再满（已卸货 / 已建城），计数器重置为 0。
-        # cart 的满载奖励逻辑方向相反，不参与此惩罚。
-        # ═══════════════════════════════════════════════════════════════════════
-        # 宽限期 = worker 的 cooldown 轮数（从 game_constants 读取），期间不施加任何惩罚。
-        # 超出宽限期的额外等待轮数记为 excess，惩罚按 excess^1.5 非线性递增：
-        #   penalty = -base * excess^exponent
-        # 示例（base=0.02, exp=1.5）：
-        #   excess=0 (宽限内) → 0
-        #   excess=1           → -0.020
-        #   excess=2           → -0.057
-        #   excess=3           → -0.104
-        #   excess=5           → -0.224
-        worker_cooldown  = GAME_CONSTANTS["PARAMETERS"]["UNIT_ACTION_COOLDOWN"]["WORKER"]  # 2
-        penalty_base     = 0.005
-        penalty_exponent = 1.5
-        full_cargo_penalty = 0.0
-
-        current_unit_ids = set(game.state["teamStates"][self.team]["units"].keys())
-
-        # 清理已消失 unit 的计数器
-        stale_ids = [uid for uid in self.unit_full_cargo_turns if uid not in current_unit_ids]
-        for uid in stale_ids:
-            del self.unit_full_cargo_turns[uid]
-
-        for unit in game.state["teamStates"][self.team]["units"].values():
-            if unit.type != Constants.UNIT_TYPES.WORKER:
-                continue  # 仅对 worker 施加惩罚
-
-            cargo_total = unit.cargo["wood"] + unit.cargo["coal"] + unit.cargo["uranium"]
-            is_full = cargo_total >= cargo_capacity  # cargo_capacity 在上方已赋值
-
-            if is_full:
-                # 计数器累加（首次满载时从 1 开始）
-                self.unit_full_cargo_turns[unit.id] = self.unit_full_cargo_turns.get(unit.id, 0) + 1
-                turns_full = self.unit_full_cargo_turns[unit.id]
-                excess = turns_full - worker_cooldown  # 超出宽限期的轮数
-                if excess > 0:
-                    full_cargo_penalty -= penalty_base * (excess ** penalty_exponent)
-            else:
-                # cargo 不满，重置计数器
-                self.unit_full_cargo_turns[unit.id] = 0
-
-        rewards["rew/r_full_cargo_penalty"] = full_cargo_penalty
-
-        # ═══════════════════════════════════════════════════════════════════════
-        # 游戏结束奖励
-        # ═══════════════════════════════════════════════════════════════════════
-        
-        # Give a reward of 1.0 per city tile alive at the end of the game
-        if is_game_finished:
-            self.is_last_turn = True
-            if city_tile_count > 0:
-                rewards["rew/r_survival"] = (worker_count + cart_count) * 0.5 + city_tile_count
-            else:
-                rewards["rew/r_survival"] = -5.0  # Game lost
-
-            '''
-            # Example of a game win/loss reward instead
-            if game.get_winning_team() == self.team:
-                rewards["rew/r_game_win"] = 100.0 # Win
-            else:
-                rewards["rew/r_game_win"] = -100.0 # Loss
-            '''
-        
-        reward = 0
-        for name, value in rewards.items():
-            reward += value
-
-        return reward
+        return self.reward_policy.get_reward(
+            game, self.team, is_game_finished, is_new_turn, is_game_error
+        )
 
     def research_heuristic(self, game, unit_threshold=1.0):
         """

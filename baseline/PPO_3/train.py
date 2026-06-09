@@ -1,6 +1,5 @@
 import argparse
 import glob
-import importlib.util
 import os
 import sys
 import random
@@ -16,39 +15,16 @@ from luxai2021.env.lux_env import LuxEnvironment, SaveReplayAndModelCallback
 from luxai2021.game.constants import LuxMatchConfigs_Default
 
 
-# ── Baseline opponent helpers ─────────────────────────────────────────────────
-# Load baseline/agent_policy.py directly by file path so it never conflicts
-# with e2's own agent_policy module.  The baseline model uses its own
-# observation space and is completely independent of e2's 91-dim obs.
-
-_BASELINE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "baseline"))
-_BASELINE_POLICY_PATH = os.path.join(_BASELINE_DIR, "agent_policy.py")
-_BASELINE_MODEL_PATH  = os.path.join(_BASELINE_DIR, "model.zip")
-
-def _load_baseline_agent_policy():
-    """Import baseline/agent_policy.py as an isolated module and return its AgentPolicy class."""
-    spec = importlib.util.spec_from_file_location("baseline_agent_policy", _BASELINE_POLICY_PATH)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module.AgentPolicy
-
-def make_baseline_opponent():
-    """Instantiate a baseline AgentPolicy in inference mode with the pretrained model."""
-    BaselineAgentPolicy = _load_baseline_agent_policy()
-    baseline_model = PPO.load(_BASELINE_MODEL_PATH)
-    return BaselineAgentPolicy(mode="inference", model=baseline_model)
-
-
-# ── Multi-env helper ──────────────────────────────────────────────────────────
 # https://stable-baselines3.readthedocs.io/en/master/guide/examples.html?highlight=SubprocVecEnv#multiprocessing-unleashing-the-power-of-vectorized-environments
 def make_env(local_env, rank, seed=0):
     """
     Utility function for multi-processed env.
 
-    :param local_env: (LuxEnvironment) the environment
+    :param local_env: (LuxEnvironment) the environment 
     :param seed: (int) the initial seed for RNG
     :param rank: (int) index of the subprocess
     """
+
     def _init():
         local_env.seed(seed + rank)
         return local_env
@@ -67,7 +43,7 @@ def get_command_line_arguments():
     parser.add_argument('--learning_rate', help='Learning rate', type=float, default=0.001)
     parser.add_argument('--gamma', help='Gamma', type=float, default=0.995)
     parser.add_argument('--gae_lambda', help='GAE Lambda', type=float, default=0.95)
-    parser.add_argument('--batch_size', help='batch_size', type=int, default=1024)
+    parser.add_argument('--batch_size', help='batch_size', type=int, default=1024)  # 64
     parser.add_argument('--step_count', help='Total number of steps to train', type=int, default=10000000)
     parser.add_argument('--n_steps', help='Number of experiences to gather before each learning period', type=int, default=2048)
     parser.add_argument('--path', help='Path to a checkpoint to load to resume training', type=str, default=None)
@@ -84,15 +60,17 @@ def train(args):
     """
     print(args)
 
+    # Run a training job
     configs = LuxMatchConfigs_Default
 
-    # Opponent: baseline pretrained model (baseline/model.zip + baseline/agent_policy.py)
-    opponent = make_baseline_opponent()
+    # Create a default opponent agent
+    # opponent = AgentPolicy(mode="inference", model=PPO.load("../baseline/PPO_5/model.zip"))
+    opponent = Agent()
 
-    # Player: e2 RL agent in training mode
+    # Create a RL agent in training mode
     player = AgentPolicy(mode="train")
 
-    # Build training environment(s)
+    # Train the model
     env_eval = None
     if args.n_envs == 1:
         env = LuxEnvironment(configs=configs,
@@ -101,17 +79,20 @@ def train(args):
     else:
         env = SubprocVecEnv([make_env(LuxEnvironment(configs=configs,
                                                      learning_agent=AgentPolicy(mode="train"),
-                                                     opponent_agent=make_baseline_opponent()), i)
-                             for i in range(args.n_envs)])
-
+                                                     opponent_agent=opponent), i) for i in range(args.n_envs)])
+    
     run_id = args.id
     print("Run id %s" % run_id)
 
     if args.path:
-        # Resume from checkpoint; keep previous model hyperparams by default
+        # by default previous model params are used (lr, batch size, gamma...)
         model = PPO.load(args.path)
         model.set_env(env=env)
+
+        # Update the learning rate
         model.lr_schedule = get_schedule_fn(args.learning_rate)
+
+        # TODO: Update other training parameters
     else:
         model = PPO("MlpPolicy",
                     env,
@@ -121,49 +102,53 @@ def train(args):
                     gamma=args.gamma,
                     gae_lambda=args.gae_lambda,
                     batch_size=args.batch_size,
-                    n_steps=args.n_steps)
+                    n_steps=args.n_steps
+                    )
 
+    
+    
     callbacks = []
 
-    # Save a checkpoint + 5 replay files every 100K steps
+    # Save a checkpoint and 5 match replay files every 100K steps
     player_replay = AgentPolicy(mode="inference", model=model)
     callbacks.append(
         SaveReplayAndModelCallback(
-            save_freq=100000,
-            save_path='./models/',
-            name_prefix=f'model{run_id}',
-            replay_env=LuxEnvironment(
-                configs=configs,
-                learning_agent=player_replay,
-                opponent_agent=Agent()
-            ),
-            replay_num_episodes=5
-        )
+                                save_freq=100000,
+                                save_path='./models/',
+                                name_prefix=f'model{run_id}',
+                                replay_env=LuxEnvironment(
+                                                configs=configs,
+                                                learning_agent=player_replay,
+                                                opponent_agent=Agent()
+                                ),
+                                replay_num_episodes=5
+                            )
     )
-
-    # Evaluation callback for multi-env setups
+    
+    # Since reward metrics don't work for multi-environment setups, we add an evaluation logger
+    # for metrics.
     if args.n_envs > 1:
+        # An evaluation environment is needed to measure multi-env setups. Use a fixed 4 envs.
         env_eval = SubprocVecEnv([make_env(LuxEnvironment(configs=configs,
-                                                          learning_agent=AgentPolicy(mode="train"),
-                                                          opponent_agent=make_baseline_opponent()), i)
-                                  for i in range(4)])
+                                                     learning_agent=AgentPolicy(mode="train"),
+                                                     opponent_agent=opponent), i) for i in range(4)])
+
         callbacks.append(
-            EvalCallback(env_eval,
-                         best_model_save_path=f'./logs_{run_id}/',
-                         log_path=f'./logs_{run_id}/',
-                         eval_freq=args.n_steps * 2,
-                         n_eval_episodes=30,
-                         deterministic=False,
-                         render=False)
+            EvalCallback(env_eval, best_model_save_path=f'./logs_{run_id}/',
+                             log_path=f'./logs_{run_id}/',
+                             eval_freq=args.n_steps*2, # Run it every 2 training iterations
+                             n_eval_episodes=30, # Run 30 games
+                             deterministic=False, render=False)
         )
 
     print("Training model...")
-    model.learn(total_timesteps=args.step_count, callback=callbacks)
+    model.learn(total_timesteps=args.step_count,
+                callback=callbacks)
     if not os.path.exists(f'models/rl_model_{run_id}_{args.step_count}_steps.zip'):
         model.save(path=f'models/rl_model_{run_id}_{args.step_count}_steps.zip')
     print("Done training model.")
 
-    # Quick inference sanity-check with rendering
+    # Inference the model
     print("Inference model policy with rendering...")
     saves = glob.glob(f'models/rl_model_{run_id}_*_steps.zip')
     latest_save = sorted(saves, key=lambda x: int(x.split('_')[-2]), reverse=True)[0]
@@ -175,21 +160,45 @@ def train(args):
         if i % 5 == 0:
             print("Turn %i" % i)
             env.render()
+
         if done:
             print("Episode done, resetting.")
             obs = env.reset()
     print("Done")
 
+    '''
+    # Learn with self-play against the learned model as an opponent now
+    print("Training model with self-play against last version of model...")
+    player = AgentPolicy(mode="train")
+    opponent = AgentPolicy(mode="inference", model=model)
+    env = LuxEnvironment(configs, player, opponent)
+    model = PPO("MlpPolicy",
+        env,
+        verbose=1,
+        tensorboard_log="./lux_tensorboard/",
+        learning_rate = 0.0003,
+        gamma=0.999,
+        gae_lambda = 0.95
+    )
+
+    model.learn(total_timesteps=2000)
+    env.close()
+    print("Done")
+    '''
+
 
 if __name__ == "__main__":
-    if sys.version_info < (3, 7) or sys.version_info >= (3, 8):
+    if sys.version_info < (3,7) or sys.version_info >= (3,8):
         os.system("")
         class style():
             YELLOW = '\033[93m'
         version = str(sys.version_info.major) + "." + str(sys.version_info.minor)
-        message = f'/!\\ Warning, python{version} detected, you will need to use python3.7 to submit to kaggle.'
+        message = f'/!\ Warning, python{version} detected, you will need to use python3.7 to submit to kaggle.'
         message = style.YELLOW + message
         print(message)
-
+    
+    # Get the command line arguments
     local_args = get_command_line_arguments()
+
+    # Train the model
     train(local_args)

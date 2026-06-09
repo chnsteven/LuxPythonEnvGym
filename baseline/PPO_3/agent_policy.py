@@ -1,4 +1,4 @@
-﻿import sys
+import sys
 import time
 import math
 from functools import partial  # pip install functools
@@ -599,10 +599,9 @@ class AgentPolicy(AgentWithModel):
             if not city_tile.can_act():
                 return np.zeros(n, dtype=bool)
 
-            # ── Mask: research already maxed (researchPoints >= URANIUM threshold) ──
-            uranium_req = GAME_CONSTANTS["PARAMETERS"]["RESEARCH_REQUIREMENTS"]["URANIUM"]
-            if game.state["teamStates"][self.team]["researchPoints"] >= uranium_req:
-                mask[2] = False  # ResearchAction — nothing left to research
+            # ── Mask: research already maxed (uranium unlocked) ───────────────
+            if game.state["teamStates"][self.team]["researched"][Constants.RESOURCE_TYPES.URANIUM]:
+                mask[2] = False  # ResearchAction
 
             # ── Mask: unit count already at city tile cap → no spawning ───────
             # Each city tile can support one unit; spawning beyond cap is wasteful.
