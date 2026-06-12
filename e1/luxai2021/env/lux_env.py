@@ -4,6 +4,7 @@ Implements the base class for a Lux environment
 import traceback
 import gym
 import os
+import numpy as np
 from stable_baselines3.common.callbacks import BaseCallback
 
 from ..game.game import Game
@@ -109,6 +110,19 @@ class LuxEnvironment(gym.Env):
         self.match_generator = None
 
         self.last_observation_object = None
+
+    def action_masks(self):
+        """
+        Boolean mask for MaskablePPO: True = action allowed, False = forbidden.
+        Uses the same entity as the most recently returned observation.
+        """
+        if self.last_observation_object is None:
+            return np.ones(self.action_space.n, dtype=bool)
+
+        unit, city_tile, team, _is_new_turn = self.last_observation_object
+        return self.learning_agent.get_padded_action_mask(
+            self.game, unit=unit, city_tile=city_tile
+        )
 
     def set_replay_path(self, replay_folder, replay_prefix):
         """
