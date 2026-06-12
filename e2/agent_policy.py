@@ -25,6 +25,29 @@ def furthest_node(node, nodes):
     return np.argmax(dist_2)
 
 
+_DIRECTION_MAPPING = {
+    Constants.DIRECTIONS.CENTER: 0,
+    Constants.DIRECTIONS.NORTH: 1,
+    Constants.DIRECTIONS.WEST: 2,
+    Constants.DIRECTIONS.SOUTH: 3,
+    Constants.DIRECTIONS.EAST: 4,
+}
+
+
+def fill_direction_distance(obs, idx, pos, target_pos, max_distance):
+    """写入 [dir_onehot×5, distance]，返回 idx+6"""
+    direction = pos.direction_to(target_pos)
+    obs[idx + _DIRECTION_MAPPING[direction]] = 1.0
+    obs[idx + 5] = min(pos.distance_to(target_pos) / max_distance, 1.0)
+    return idx + 6
+
+
+def fill_empty_direction_distance(obs, idx):
+    """无目标时 baseline 写法：distance 槽置 1.0"""
+    obs[idx + 5] = 1.0
+    return idx + 6
+
+
 def smart_transfer_to_nearby(
     game, team, unit_id, unit, target_type_restriction=None, **kwarg
 ):
@@ -164,38 +187,31 @@ class AgentPolicy(AgentWithModel):
         # 结构化观察空间设计（Structured Observation Space）
         # ═══════════════════════════════════════════════════════════════════════
         #
-        # 1. 自身状态 (Self State) - 8 维
-        #    [unit_type×3, pos×2, cargo×3]
+        # 1. 自身状态 (Self State) - 9 维
+        #    [unit_type×3, pos×2, cargo×3, cargo_space_left]
         #
-        # 2. 资源信息 (Resources) - Top-1 closest + Top-1 furthest × 5 = 10 维
-        #    每个资源槽: [type_wood, type_coal, type_uranium, distance, val]
+        # 2. 资源 per-type nearest - 21 维
+        #    wood/coal/uranium 各 [dir×5, dist, val]
         #    val = 采集优先度，归一化到已研究最高等级=1.0
-        #      仅有 wood:          wood=1.0, coal=0.0,  uranium=0.0
-        #      researched coal:    coal=1.0, wood=0.1,  uranium=0.0
-        #      researched uranium: uranium=1.0, coal=0.1, wood=0.025
         #
-        # 3. 友方单位 (Friendly Units) - Top-1 closest + Top-1 furthest × 4 = 8 维
-        #    每个单位槽: [type_worker, type_cart, distance, cargo_space_left]
+        # 3. 友方单位 (Friendly Units) - Top-1 closest + Top-1 furthest × 9 = 18 维
+        #    每个单位槽: [dir×5, dist, type_worker, type_cart, cargo_space_left]
         #
-        # 4. 友方城市 (Friendly Cities) - Top-1 closest + Top-1 furthest × 3 = 6 维
-        #    每个城市槽: [distance, fuel_efficiency, fuel_survival]
+        # 4. 友方城市 (Friendly Cities) - Top-1 closest + Top-1 furthest × 8 = 16 维
+        #    每个城市槽: [dir×5, dist, fuel_efficiency, fuel_survival]
         #
-        # 5. 全局信息 (Global State) - 11 维
+        # 5. 全局信息 (Global State) - 9 维
         #    [is_night, progress, til_night, til_day,
-        #     workers, carts, e_workers, e_carts,
-        #     research_pts, coal_ok, uranium_ok]
+        #     workers, carts, e_workers, e_carts, research_pts]
         #
         # 6. 全局资源密度图 (Resource Density Map) - 4×4×3 = 48 维
-        #    将地图划分为 4×4 个区域，每个区域统计三种资源（wood/coal/uranium）的格子数量
-        #    归一化：每个桶的值 = 该桶内该资源格子数 / 该桶最大可能格子数
-        #    排列方式：逐行展开，resource 在最内层
-        #    [bucket(0,0)_wood, bucket(0,0)_coal, bucket(0,0)_uranium,
-        #     bucket(0,1)_wood, ..., bucket(3,3)_uranium]
+        #
+        # 7. 友方城市密度图 (City Density Map) - 4×4×1 = 16 维
         #
         # ═══════════════════════════════════════════════════════════════════════
-        # 总维度: 8 + 10 + 8 + 6 + 11 + 48 = 91 维
+        # 总维度: 9 + 21 + 18 + 16 + 9 + 48 + 16 = 137 维
         # ═══════════════════════════════════════════════════════════════════════
-        self.observation_shape = (91,)
+        self.observation_shape = (137,)
         self.observation_space = spaces.Box(
             low=0, high=1, shape=self.observation_shape, dtype=np.float16
         )
@@ -331,17 +347,28 @@ class AgentPolicy(AgentWithModel):
             -1
         )  # shape: (48,)
 
+        # ── 4×4 友方城市密度桶 ────────────────────────────────────────────────
+        city_counts = np.zeros((N_BUCKETS, N_BUCKETS), dtype=np.float32)
+        for city in game.cities.values():
+            if city.team != team:
+                continue
+            for cell in city.city_cells:
+                col = min(int(cell.pos.x / bucket_w), N_BUCKETS - 1)
+                row = min(int(cell.pos.y / bucket_h), N_BUCKETS - 1)
+                city_counts[row, col] += 1.0
+        self.city_density_obs = (city_counts / max_cells_per_bucket).reshape(-1)
+
     def get_observation(self, game, unit, city_tile, team, is_new_turn):
         """
-        结构化观察空间 (91维)
-        1. 自身状态                 8维  [unit_type×3, pos×2, cargo×3]
-        2. 资源 Top-1close+1far    10维  [type_oh×3, dist, val] × 2
-        3. 友方单位 Top-1c+1f       8维  [type_oh×2, dist, cargo_left] × 2
-        4. 友方城市 Top-1c+1f       6维  [dist, fuel_eff, fuel_surv] × 2
-        5. 全局信息                11维  [is_night, progress, til_night, til_day,
-                                         workers, carts, e_workers, e_carts,
-                                         research_pts, coal_ok, uranium_ok]
-        6. 全局资源密度图 4×4×3    48维  逐行展开，每桶[wood, coal, uranium]
+        结构化观察空间 (137维)
+        1. 自身状态                 9维  [unit_type×3, pos×2, cargo×3, cargo_space_left]
+        2. 资源 per-type nearest    21维  [dir×5, dist, val] × 3
+        3. 友方单位 Top-1c+1f      18维  [dir×5, dist, type×2, cargo_left] × 2
+        4. 友方城市 Top-1c+1f      16维  [dir×5, dist, fuel_eff, fuel_surv] × 2
+        5. 全局信息                 9维  [is_night, progress, til_night, til_day,
+                                         workers, carts, e_workers, e_carts, research_pts]
+        6. 全局资源密度图 4×4×3    48维
+        7. 友方城市密度图 4×4×1    16维
         """
         if is_new_turn:
             self.get_initial_observation(game, unit, city_tile, team)
@@ -356,7 +383,7 @@ class AgentPolicy(AgentWithModel):
         )
         pos_arr = np.array([pos.x, pos.y]) if pos is not None else None
 
-        # ── 1. 自身状态 (8维) ─────────────────────────────────────────────────
+        # ── 1. 自身状态 (9维) ─────────────────────────────────────────────────
         if unit is not None:
             obs[idx] = 1.0 if unit.type == Constants.UNIT_TYPES.WORKER else 0.0
             obs[idx + 1] = 1.0 if unit.type == Constants.UNIT_TYPES.CART else 0.0
@@ -376,9 +403,12 @@ class AgentPolicy(AgentWithModel):
             obs[idx + 2] = unit.cargo["uranium"] / cap
         idx += 3
 
-        # ── 2. 资源 Top-1 closest + Top-1 furthest (10维) ────────────────────
-        if pos_arr is not None:
-            # 根据已研究等级确定各资源的采集优先度（val），归一化到最高已研究=1.0
+        if unit is not None:
+            obs[idx] = unit.get_cargo_space_left() / self.cargo_capacity
+        idx += 1
+
+        # ── 2. 资源 per-type nearest (21维) ───────────────────────────────────
+        if pos is not None and pos_arr is not None:
             researched_coal = game.state["teamStates"][team]["researched"]["coal"]
             researched_uranium = game.state["teamStates"][team]["researched"]["uranium"]
             if researched_uranium:
@@ -400,51 +430,38 @@ class AgentPolicy(AgentWithModel):
                     Constants.RESOURCE_TYPES.URANIUM: 0.0,
                 }
 
-            # 收集所有已研究资源节点
-            all_nodes = []
-            rtype_map = []
             for rtype in [
                 Constants.RESOURCE_TYPES.WOOD,
                 Constants.RESOURCE_TYPES.COAL,
                 Constants.RESOURCE_TYPES.URANIUM,
             ]:
                 if rtype == Constants.RESOURCE_TYPES.COAL and not researched_coal:
+                    idx += 7
                     continue
-                if rtype == Constants.RESOURCE_TYPES.URANIUM and not researched_uranium:
+                if (
+                    rtype == Constants.RESOURCE_TYPES.URANIUM
+                    and not researched_uranium
+                ):
+                    idx += 7
                     continue
-                if rtype not in self.object_nodes:
+                if rtype not in self.object_nodes or len(self.object_nodes[rtype]) == 0:
+                    idx = fill_empty_direction_distance(obs, idx)
+                    idx += 1
                     continue
                 nodes = self.object_nodes[rtype]
-                for node in nodes:
-                    all_nodes.append(node)
-                    rtype_map.append(rtype)
-
-            def fill_resource_slot(node, rtype):
-                dist = ((node - pos_arr) ** 2).sum() ** 0.5
-                if rtype == Constants.RESOURCE_TYPES.WOOD:
-                    obs[idx] = 1.0
-                elif rtype == Constants.RESOURCE_TYPES.COAL:
-                    obs[idx + 1] = 1.0
-                elif rtype == Constants.RESOURCE_TYPES.URANIUM:
-                    obs[idx + 2] = 1.0
-                obs[idx + 3] = dist / self.max_distance
-                obs[idx + 4] = resource_val.get(rtype, 0.0)
-
-            if all_nodes:
-                nodes_arr = np.array(all_nodes)
-                ci = closest_node(pos_arr, nodes_arr)
-                fi = furthest_node(pos_arr, nodes_arr)
-                fill_resource_slot(all_nodes[ci], rtype_map[ci])
-                idx += 5
-                fill_resource_slot(all_nodes[fi], rtype_map[fi])
-                idx += 5
-            else:
-                idx += 10
+                ci = closest_node(pos_arr, nodes)
+                closest = nodes[ci]
+                target_pos = Position(closest[0], closest[1])
+                idx = fill_direction_distance(
+                    obs, idx, pos, target_pos, self.max_distance
+                )
+                obs[idx] = resource_val.get(rtype, 0.0)
+                idx += 1
         else:
-            idx += 10
+            idx += 21
 
-        # ── 3. 友方单位 Top-1 closest + Top-1 furthest (8维) ─────────────────
-        if pos_arr is not None:
+        # ── 3. 友方单位 Top-1 closest + Top-1 furthest (18维) ────────────────
+        if pos is not None and pos_arr is not None:
             friendly_nodes = []
             friendly_utypes = []
             friendly_cargo_lefts = []
@@ -455,7 +472,7 @@ class AgentPolicy(AgentWithModel):
                 nodes = self.object_nodes[key]
                 for node in nodes:
                     if unit is not None and node[0] == pos.x and node[1] == pos.y:
-                        continue  # 排除自己
+                        continue
                     node_pos = Position(node[0], node[1])
                     cell = game.map.get_cell_by_pos(node_pos)
                     cargo_left = (
@@ -467,67 +484,50 @@ class AgentPolicy(AgentWithModel):
                     friendly_utypes.append(utype)
                     friendly_cargo_lefts.append(cargo_left)
 
-            def fill_unit_slot(i):
+            def fill_unit_slot(i, start_idx):
                 node = friendly_nodes[i]
-                dist = ((node - pos_arr) ** 2).sum() ** 0.5
-                obs[idx] = (
-                    1.0 if friendly_utypes[i] == Constants.UNIT_TYPES.WORKER else 0.0
+                target_pos = Position(node[0], node[1])
+                next_idx = fill_direction_distance(
+                    obs, start_idx, pos, target_pos, self.max_distance
                 )
-                obs[idx + 1] = (
-                    1.0 if friendly_utypes[i] == Constants.UNIT_TYPES.CART else 0.0
+                obs[next_idx] = (
+                    1.0
+                    if friendly_utypes[i] == Constants.UNIT_TYPES.WORKER
+                    else 0.0
                 )
-                obs[idx + 2] = dist / self.max_distance
-                obs[idx + 3] = friendly_cargo_lefts[i] / self.cargo_capacity
+                obs[next_idx + 1] = (
+                    1.0
+                    if friendly_utypes[i] == Constants.UNIT_TYPES.CART
+                    else 0.0
+                )
+                obs[next_idx + 2] = (
+                    friendly_cargo_lefts[i] / self.cargo_capacity
+                )
+                return next_idx + 3
 
             if friendly_nodes:
                 nodes_arr = np.array(friendly_nodes)
                 ci = closest_node(pos_arr, nodes_arr)
                 fi = furthest_node(pos_arr, nodes_arr)
-                fill_unit_slot(ci)
-                idx += 4
-                fill_unit_slot(fi)
-                idx += 4
+                idx = fill_unit_slot(ci, idx)
+                idx = fill_unit_slot(fi, idx)
             else:
-                idx += 8
+                idx = fill_empty_direction_distance(obs, idx)
+                idx += 3
+                idx = fill_empty_direction_distance(obs, idx)
+                idx += 3
         else:
-            idx += 8
+            idx += 18
 
-        # ── 4. 敌方单位 Top-2 closest + Top-2 furthest (16维) ────────────────
-        # if pos_arr is not None:
-        #     enemy_units = []
-        #     for utype in [Constants.UNIT_TYPES.WORKER, Constants.UNIT_TYPES.CART]:
-        #         key = str(utype) + "_opponent"
-        #         if key not in self.object_nodes:
-        #             continue
-        #         nodes = self.object_nodes[key]
-        #         for node in nodes:
-        #             node_pos = Position(node[0], node[1])
-        #             dist = ((node - pos_arr) ** 2).sum() ** 0.5
-        #             cell = game.map.get_cell_by_pos(node_pos)
-        #             cargo_left = next(iter(cell.units.values())).get_cargo_space_left() if cell.units else self.cargo_capacity
-        #             enemy_units.append((dist, utype, cargo_left))
-
-        #     slots = top2_close_far(enemy_units, key_dist=lambda x: x[0])
-        #     for slot in slots:
-        #         if slot is not None:
-        #             dist, utype, cargo_left = slot
-        #             obs[idx]     = 1.0 if utype == Constants.UNIT_TYPES.WORKER else 0.0
-        #             obs[idx + 1] = 1.0 if utype == Constants.UNIT_TYPES.CART   else 0.0
-        #             obs[idx + 2] = dist / self.max_distance
-        #             obs[idx + 3] = cargo_left / self.cargo_capacity
-        #         idx += 4
-        # else:
-        #     idx += 16
-
-        # ── 5. 友方城市 Top-1 closest + Top-1 furthest (6维) ─────────────────
-        if pos_arr is not None:
-            city_data = []  # (dist, fuel_eff, fuel_surv, tile_coords)
+        # ── 4. 友方城市 Top-1 closest + Top-1 furthest (16维) ────────────────
+        if pos is not None and pos_arr is not None:
+            city_data = []
             for city in game.cities.values():
                 if city.team != team:
                     continue
                 tile_coords = np.array([[c.pos.x, c.pos.y] for c in city.city_cells])
                 ci = closest_node(pos_arr, tile_coords)
-                dist = ((tile_coords[ci] - pos_arr) ** 2).sum() ** 0.5
+                closest_cell_pos = Position(tile_coords[ci][0], tile_coords[ci][1])
 
                 upkeep = city.get_light_upkeep()
                 default_upkeep = (
@@ -540,48 +540,32 @@ class AgentPolicy(AgentWithModel):
                     if upkeep > 0
                     else 1.0
                 )
-                city_data.append((dist, fuel_eff, fuel_surv))
+                city_data.append((fuel_eff, fuel_surv, closest_cell_pos))
 
-            def fill_city_slot(item):
-                dist, fuel_eff, fuel_surv = item
-                obs[idx] = dist / self.max_distance
-                obs[idx + 1] = fuel_eff
-                obs[idx + 2] = fuel_surv
+            def fill_city_slot(item, start_idx):
+                fuel_eff, fuel_surv, cell_pos = item
+                next_idx = fill_direction_distance(
+                    obs, start_idx, pos, cell_pos, self.max_distance
+                )
+                obs[next_idx] = fuel_eff
+                obs[next_idx + 1] = fuel_surv
+                return next_idx + 2
 
             if city_data:
-                city_dists = np.array([c[0] for c in city_data]).reshape(-1, 1)
-                ci = closest_node(np.array([[0.0]]), city_dists)  # index of min dist
-                fi = furthest_node(np.array([[0.0]]), city_dists)  # index of max dist
-                fill_city_slot(city_data[ci])
-                idx += 3
-                fill_city_slot(city_data[fi])
-                idx += 3
+                city_positions = np.array(
+                    [[c[2].x, c[2].y] for c in city_data]
+                )
+                ci = closest_node(pos_arr, city_positions)
+                fi = furthest_node(pos_arr, city_positions)
+                idx = fill_city_slot(city_data[ci], idx)
+                idx = fill_city_slot(city_data[fi], idx)
             else:
-                idx += 6
+                idx = fill_empty_direction_distance(obs, idx)
+                idx += 2
+                idx = fill_empty_direction_distance(obs, idx)
+                idx += 2
         else:
-            idx += 6
-
-        # ── 6. 敌方城市 Top-2 closest + Top-2 furthest (8维) ─────────────────
-        # if pos_arr is not None:
-        #     opponent_team = (team + 1) % 2
-        #     enemy_cities = []
-        #     for city in game.cities.values():
-        #         if city.team != opponent_team:
-        #             continue
-        #         tile_coords = np.array([[c.pos.x, c.pos.y] for c in city.city_cells])
-        #         ci   = closest_node(pos_arr, tile_coords)
-        #         dist = ((tile_coords[ci] - pos_arr) ** 2).sum() ** 0.5
-        #         enemy_cities.append((dist, len(city.city_cells)))
-
-        #     slots = top2_close_far(enemy_cities, key_dist=lambda x: x[0])
-        #     for slot in slots:
-        #         if slot is not None:
-        #             dist, tile_count = slot
-        #             obs[idx]     = dist / self.max_distance
-        #             obs[idx + 1] = tile_count / self.max_city_tiles
-        #         idx += 2
-        # else:
-        #     idx += 8
+            idx += 16
 
         # ── 7. 全局信息 (11维) ────────────────────────────────────────────────
         obs[idx] = float(game.is_night())
@@ -625,15 +609,16 @@ class AgentPolicy(AgentWithModel):
             1.0,
         )
         idx += 1
-        obs[idx] = float(game.state["teamStates"][team]["researched"]["coal"])
-        idx += 1
-        obs[idx] = float(game.state["teamStates"][team]["researched"]["uranium"])
-        idx += 1
 
         # ── 6. 全局资源密度图 4×4×3 = 48 维 ──────────────────────────────────
         obs[idx : idx + 48] = self.resource_density_obs
         idx += 48
 
+        # ── 7. 友方城市密度图 4×4×1 = 16 维 ──────────────────────────────────
+        obs[idx : idx + 16] = self.city_density_obs
+        idx += 16
+
+        assert idx == 137
         return obs
 
     def get_action_mask(self, game, unit=None, city_tile=None):
@@ -943,7 +928,6 @@ class AgentPolicy(AgentWithModel):
         Args:
             game ([type]): Game.
         """
-        self.units_last = 0
         self.city_tiles_last = 0
         self.fuel_collected_last = 0
         # upkeep 效率追踪：记录上一回合城市总 fuel，用于计算净消耗
@@ -958,9 +942,13 @@ class AgentPolicy(AgentWithModel):
         self.workers_last = 0
         self.carts_last = 0
         self.cities_last = 0  # 城市数量（不是 tile 数量）
-        # 满资源滞留惩罚：记录每个 unit 连续满资源的回合数
-        # {unit_id: int}  0 表示当前未满或刚满第一轮（无惩罚）
-        self.unit_full_cargo_turns = {}
+        # 同 cargo 滞留：{unit_id: (wood, coal, uranium)} 与连续相同回合数
+        self.unit_cargo_last = {}
+        self.unit_same_cargo_turns = {}
+        # 运 cart 奖励：友方 cart 总载货量
+        self.cart_cargo_sum_last = 0
+        # cart 装载持续回合（用于指数奖励）
+        self.cart_fill_turns = {}
 
         if self.mode == "train":
             self._heuristic_games_played = (
@@ -1020,9 +1008,10 @@ class AgentPolicy(AgentWithModel):
         # 城市扩张和单位创建
         # ═══════════════════════════════════════════════════════════════════════
 
-        # Give a reward for unit creation/death. 0.05 reward per unit.
-        rewards["rew/r_units"] = (unit_count - self.units_last) * 0.05
-        self.units_last = unit_count
+        rewards["rew/r_workers"] = (worker_count - self.workers_last) * 0.05
+        rewards["rew/r_carts"] = (cart_count - self.carts_last) * 0.15
+        self.workers_last = worker_count
+        self.carts_last = cart_count
 
         # Give a reward for city creation/death. 0.1 reward per city.
         rewards["rew/r_city_tiles"] = (city_tile_count - self.city_tiles_last) * 0.1
@@ -1032,27 +1021,52 @@ class AgentPolicy(AgentWithModel):
         rewards["rew/r_units_alive"] = unit_count * 0.01
         rewards["rew/r_city_tiles_alive"] = city_tile_count * 0.02
 
-        # 简单采集奖励：每回合新增的燃料量
+        cart_capacity = GAME_CONSTANTS["PARAMETERS"]["RESOURCE_CAPACITY"]["CART"]
+
+        # 运到 city：燃料增量（worker 在城格卸货）
         fuel_now = game.stats["teamStats"][self.team]["fuelGenerated"]
-        rewards["rew/r_collect"] = (fuel_now - self.fuel_collected_last) / 5000
+        fuel_delta = fuel_now - self.fuel_collected_last
+        rewards["rew/r_to_city"] = fuel_delta / 5000
         self.fuel_collected_last = fuel_now
 
-        # Cart 装载率奖励：鼓励 cart 保持高 cargo 占用率
-        cart_capacity = GAME_CONSTANTS["PARAMETERS"]["RESOURCE_CAPACITY"]["CART"]
-        cart_fill_total = 0.0
-        cart_count_actual = 0
+        # 运到 cart：友方 cart 总载货量增加量
+        cart_cargo_sum = 0
         for unit in game.state["teamStates"][self.team]["units"].values():
             if unit.type == Constants.UNIT_TYPES.CART:
-                cargo_total = (
+                cart_cargo_sum += (
                     unit.cargo["wood"] + unit.cargo["coal"] + unit.cargo["uranium"]
                 )
-                cart_fill_total += cargo_total / cart_capacity
-                cart_count_actual += 1
-        rewards["rew/r_cart_fill"] = (
-            (cart_fill_total / cart_count_actual * 0.15)
-            if cart_count_actual > 0
-            else 0.0
-        )
+        cart_cargo_delta = cart_cargo_sum - self.cart_cargo_sum_last
+        rewards["rew/r_to_cart"] = max(0, cart_cargo_delta) / cart_capacity
+        self.cart_cargo_sum_last = cart_cargo_sum
+
+        # # cart 装载比例奖励：有货时 streak+1，指数增长但封顶（避免 1.5^N 爆炸）
+        # cart_fill_reward = 0.0
+        # cart_fill_base = 0.01
+        # cart_fill_growth = 1.5
+        # max_exp_streak = 12
+        # current_cart_ids = set()
+        # for unit in game.state["teamStates"][self.team]["units"].values():
+        #     if unit.type != Constants.UNIT_TYPES.CART:
+        #         continue
+        #     current_cart_ids.add(unit.id)
+        #     cargo_total = (
+        #         unit.cargo["wood"] + unit.cargo["coal"] + unit.cargo["uranium"]
+        #     )
+        #     fill_ratio = cargo_total / cart_capacity
+        #     if fill_ratio > 0:
+        #         self.cart_fill_turns[unit.id] = self.cart_fill_turns.get(unit.id, 0) + 1
+        #         streak = self.cart_fill_turns[unit.id]
+        #         exp_streak = min(max(streak - 1, 0), max_exp_streak)
+        #         cart_fill_reward += (
+        #             fill_ratio * cart_fill_base * (cart_fill_growth**exp_streak)
+        #         )
+        #     else:
+        #         self.cart_fill_turns[unit.id] = 0
+        # for uid in list(self.cart_fill_turns.keys()):
+        #     if uid not in current_cart_ids:
+        #         del self.cart_fill_turns[uid]
+        # rewards["rew/r_cart_fill"] = cart_fill_reward
 
         # ═══════════════════════════════════════════════════════════════════════
         # 研究解锁一次性奖励
@@ -1072,14 +1086,14 @@ class AgentPolicy(AgentWithModel):
 
         # coal 解锁：上一回合未解锁，本回合解锁
         if researched_coal and not self.researched_coal_last:
-            rewards["rew/r_unlock_coal"] = 1.0
+            rewards["rew/r_unlock_coal"] = 2.0
         else:
             rewards["rew/r_unlock_coal"] = 0.0
         self.researched_coal_last = researched_coal
 
         # uranium 解锁：研究点数首次达到 200（等价于 researched["uranium"] 刚变 True）
         if researched_uranium and not self.researched_uranium_last:
-            rewards["rew/r_unlock_uranium"] = 2.0
+            rewards["rew/r_unlock_uranium"] = 5.0
         else:
             rewards["rew/r_unlock_uranium"] = 0.0
         self.researched_uranium_last = researched_uranium
@@ -1093,7 +1107,7 @@ class AgentPolicy(AgentWithModel):
         # 如果当前采集的资源不是已研究的最高等级，每少一级减半。
 
         cargo_quality_reward = 0.0
-        base_quality_reward = 0.1
+        base_quality_reward = 0.2
         cargo_capacity = GAME_CONSTANTS["PARAMETERS"]["RESOURCE_CAPACITY"]["WORKER"]
 
         # 确定当前已研究的最高资源等级
@@ -1133,69 +1147,49 @@ class AgentPolicy(AgentWithModel):
                 multiplier = tier_multipliers.get(resource_type, 0.0)
                 if multiplier > 0.0:
                     cargo_quality_reward += multiplier
-            # elif not cell.is_city_tile() and cell.road <= game.configs["parameters"]["MIN_ROAD"]:
-            #     # 格子既没有资源、不是城市、也没有道路 → 纯空地，给予惩罚
-            #     cargo_quality_reward -= 0.01
 
         rewards["rew/r_cargo_quality"] = cargo_quality_reward
 
-        # ═══════════════════════════════════════════════════════════════════════
-        # 满资源滞留惩罚：鼓励 worker 及时卸货，而不是满载停滞
-        # ═══════════════════════════════════════════════════════════════════════
-        #
-        # 当 worker 的 cargo 达到上限时，计数器 +1（第一轮满载时初始化为 1）。
-        # 惩罚 = -penalty_per_turn * counter，随持续回合数线性递增。
-        # 一旦 cargo 不再满（已卸货 / 已建城），计数器重置为 0。
-        # cart 的满载奖励逻辑方向相反，不参与此惩罚。
-        # ═══════════════════════════════════════════════════════════════════════
-        # 宽限期 = worker 的 cooldown 轮数（从 game_constants 读取），期间不施加任何惩罚。
-        # 超出宽限期的额外等待轮数记为 excess，惩罚按 excess^1.5 非线性递增：
-        #   penalty = -base * excess^exponent
-        # 示例（base=0.02, exp=1.5）：
-        #   excess=0 (宽限内) → 0
-        #   excess=1           → -0.020
-        #   excess=2           → -0.057
-        #   excess=3           → -0.104
-        #   excess=5           → -0.224
-        worker_cooldown = GAME_CONSTANTS["PARAMETERS"]["UNIT_ACTION_COOLDOWN"][
-            "WORKER"
-        ]  # 2
-        penalty_base = 0.01
-        penalty_exponent = 1.25
-        full_cargo_penalty = 0.0
+        # # ═══════════════════════════════════════════════════════════════════════
+        # # 同 cargo 滞留惩罚：cargo 连续多回合完全不变时施加指数惩罚
+        # # 例：wood=40 连续 4 回合 → 第 1 回合无惩罚，第 2 回合起指数递增
+        # # ═══════════════════════════════════════════════════════════════════════
+        # same_cargo_penalty = 0.0
+        # penalty_base = 0.01
+        # penalty_growth = 1.5
+        # same_cargo_grace = 1
+        # max_exp_streak = 12
 
-        current_unit_ids = set(game.state["teamStates"][self.team]["units"].keys())
+        # current_unit_ids = set(game.state["teamStates"][self.team]["units"].keys())
+        # for uid in list(self.unit_cargo_last.keys()):
+        #     if uid not in current_unit_ids:
+        #         self.unit_cargo_last.pop(uid, None)
+        #         self.unit_same_cargo_turns.pop(uid, None)
 
-        # 清理已消失 unit 的计数器
-        stale_ids = [
-            uid for uid in self.unit_full_cargo_turns if uid not in current_unit_ids
-        ]
-        for uid in stale_ids:
-            del self.unit_full_cargo_turns[uid]
+        # for unit in game.state["teamStates"][self.team]["units"].values():
+        #     if unit.type != Constants.UNIT_TYPES.WORKER:
+        #         continue
 
-        for unit in game.state["teamStates"][self.team]["units"].values():
-            if unit.type != Constants.UNIT_TYPES.WORKER:
-                continue  # 仅对 worker 施加惩罚
+        #     cargo_t = (unit.cargo["wood"], unit.cargo["coal"], unit.cargo["uranium"])
+        #     if sum(cargo_t) == 0:
+        #         self.unit_same_cargo_turns[unit.id] = 0
+        #         self.unit_cargo_last[unit.id] = cargo_t
+        #         continue
 
-            cargo_total = (
-                unit.cargo["wood"] + unit.cargo["coal"] + unit.cargo["uranium"]
-            )
-            is_full = cargo_total >= cargo_capacity  # cargo_capacity 在上方已赋值
+        #     if self.unit_cargo_last.get(unit.id) == cargo_t:
+        #         self.unit_same_cargo_turns[unit.id] = (
+        #             self.unit_same_cargo_turns.get(unit.id, 0) + 1
+        #         )
+        #     else:
+        #         self.unit_same_cargo_turns[unit.id] = 1
+        #     self.unit_cargo_last[unit.id] = cargo_t
 
-            if is_full:
-                # 计数器累加（首次满载时从 1 开始）
-                self.unit_full_cargo_turns[unit.id] = (
-                    self.unit_full_cargo_turns.get(unit.id, 0) + 1
-                )
-                turns_full = self.unit_full_cargo_turns[unit.id]
-                excess = turns_full - worker_cooldown  # 超出宽限期的轮数
-                if excess > 0:
-                    full_cargo_penalty -= penalty_base * (excess**penalty_exponent)
-            else:
-                # cargo 不满，重置计数器
-                self.unit_full_cargo_turns[unit.id] = 0
+        #     streak = self.unit_same_cargo_turns[unit.id]
+        #     if streak > same_cargo_grace:
+        #         excess = min(streak - same_cargo_grace, max_exp_streak)
+        #         same_cargo_penalty -= penalty_base * (penalty_growth**excess)
 
-        rewards["rew/r_full_cargo_penalty"] = full_cargo_penalty
+        # rewards["rew/r_same_cargo_penalty"] = same_cargo_penalty
 
         # ═══════════════════════════════════════════════════════════════════════
         # 游戏结束奖励

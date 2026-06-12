@@ -1,0 +1,11 @@
+{
+  "timestamp": "2026-06-12T22:42:11",
+  "agent0": "agent1/main.py",
+  "agent1": "agent2/main.py",
+  "games": 50,
+  "failed": 0,
+  "wins_agent0": 22,
+  "wins_agent1": 28,
+  "win_rate_agent0": 0.44,
+  "win_rate_agent1": 0.56
+}

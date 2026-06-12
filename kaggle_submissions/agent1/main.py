@@ -1,4 +1,4 @@
-from stable_baselines3 import PPO  # pip install stable-baselines3
+from sb3_contrib import MaskablePPO
 
 from luxai2021.env.agent import AgentFromStdInOut
 from luxai2021.env.lux_env import LuxEnvironment
@@ -20,7 +20,7 @@ if __name__ == "__main__":
     #model_id = 5403
     #total_steps = int(48e6)
     #model = PPO.load(f"models/rl_model_{model_id}_{total_steps}_steps.zip")
-    model = PPO.load(f"model.zip")
+    model = MaskablePPO.load("model.zip")
     
     # Create a kaggle-remote opponent agent
     opponent = AgentFromStdInOut()
